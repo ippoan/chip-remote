@@ -14,7 +14,7 @@ Debug modes (no network):
 Config: %APPDATA%\chip-remote\config.json (UTF-8)
   { "url": "https://chip-remote.ippoan.org", "token": "...",
     "labels": { "marker": "...", "start": "...", "dismiss": "..." },
-    "locateTimeoutSec": 60, "scanIntervalSec": 2, "takeoverBackoffSec": 300,
+    "locateTimeoutSec": 5, "scanIntervalSec": 2, "takeoverBackoffSec": 300,
     "raiseWaitSec": 5, "preventSleep": true }
 Log:    %LOCALAPPDATA%\chip-remote\agent.log (rotated at 1 MB)
 
@@ -192,7 +192,7 @@ function Close-WsQuietly {
 
 # ---------------------------------------------------------------- locate queue
 
-# task_id -> @{ task_id; title; tldr; deadline; raised }
+# task_id -> @{ task_id; title; tldr; deadline }
 $script:LocateQueue = @{}
 
 # Seconds to wait for Chromium to rebuild its a11y tree after un-occluding the window.
@@ -214,8 +214,6 @@ function Add-LocateItem {
         title    = [string]$Chip.title
         tldr     = $tl
         deadline = (Get-Date).AddSeconds($TimeoutSec)
-        raised   = $false
-        found    = $false
     }
     Write-AgentLog ('queued ' + $id)
 }
@@ -226,26 +224,11 @@ function Invoke-LocateScan {
     $chips = @()
     try {
         $window = Get-ClaudeWindow
-        if ($window) {
-            $chips = @(Get-ChipList -Window $window -Labels $Labels)
-            # Not visible without disturbing the screen: raise the window once per chip.
-            $unraised = @($script:LocateQueue.Values | Where-Object {
-                    -not $_.raised -and -not (Select-Chip -Chips $chips -Title $_.title -Tldr $_.tldr) })
-            if ($unraised.Count -gt 0) {
-                Invoke-WithClaudeRaised -Window $window -ScriptBlock {
-                    [void](Wait-ChipList -Window $window -Labels $Labels -TimeoutSec $script:RaiseWaitSec)
-                    [void](Wait-ChipList -Window $window -Labels $Labels -Title $unraised[0].title `
-                        -Tldr $unraised[0].tldr -TimeoutSec 1.5)
-                    foreach ($u in $unraised) {
-                        # Chips behind the pager of a multi-chip session need paging to be seen.
-                        if (Find-ChipPaged -Window $window -Labels $Labels -Title $u.title -Tldr $u.tldr) {
-                            $u.found = $true
-                        }
-                    }
-                }
-                foreach ($u in $unraised) { $u.raised = $true }
-            }
-        }
+        # Read-only: never move the window here. A chip appears while the user is at the
+        # PC, so raising Claude would steal the screen. If the window is covered the chip
+        # is simply not found and the phone gets located=false; the raise happens only
+        # when an action arrives from the phone (Invoke-ChipRequest).
+        if ($window) { $chips = @(Get-ChipList -Window $window -Labels $Labels) }
     } catch {
         Write-AgentLog ('scan failed: ' + $_.Exception.Message) 'WARN'
     }
@@ -254,7 +237,7 @@ function Invoke-LocateScan {
         $item = $script:LocateQueue[$id]
         $hit = $null
         if ($chips.Count -gt 0) { $hit = Select-Chip -Chips $chips -Title $item.title -Tldr $item.tldr }
-        if ($hit -or $item.found) {
+        if ($hit) {
             Send-WsJson $Socket ([ordered]@{ type = 'chip.located'; task_id = $id })
             $script:LocateQueue.Remove($id)
         } elseif ($now -ge $item.deadline) {
@@ -390,7 +373,7 @@ function Invoke-ResidentMode {
         return 2
     }
     $uri = Get-WebSocketUri $url
-    $locateTimeout = [int](Get-ConfigValue $Config 'locateTimeoutSec' 60)
+    $locateTimeout = [int](Get-ConfigValue $Config 'locateTimeoutSec' 5)
     $scanInterval = [int](Get-ConfigValue $Config 'scanIntervalSec' 2)
     $takeoverBackoff = [int](Get-ConfigValue $Config 'takeoverBackoffSec' 300)
     if ($scanInterval -lt 1) { $scanInterval = 1 }
