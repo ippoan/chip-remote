@@ -1,0 +1,1 @@
+{"session_id":"s","cwd":"/tmp","hook_event_name":"PostToolUse","tool_name":"mcp__ccd_session__dismiss_task","tool_input":{"task_id":"../admin?x=1"},"tool_response":"?"}

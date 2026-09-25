@@ -1,0 +1,81 @@
+name: agent-hooks
+
+on:
+  pull_request:
+    paths:
+      - "windows-agent/**"
+      - "hooks/**"
+      - ".github/workflows/agent-hooks.yml"
+  push:
+    branches: [main]
+    paths:
+      - "windows-agent/**"
+      - "hooks/**"
+      - ".github/workflows/agent-hooks.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-hooks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hooks-linux:
+    name: hooks (bash)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+          command -v jq >/dev/null || { sudo apt-get update && sudo apt-get install -y jq; }
+          shellcheck --version | head -n 2
+          jq --version
+
+      - name: shellcheck
+        run: shellcheck hooks/*.sh hooks/test/*.sh
+
+      - name: hook tests
+        run: bash hooks/test/run.sh
+
+  agent-windows:
+    name: windows-agent + hooks (PowerShell 5.1)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSVersionTable.PSVersion.ToString()
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
+          (Get-Module -ListAvailable PSScriptAnalyzer | Select-Object -First 1).Version.ToString()
+
+      # ASCII-only, parse errors, Import-Module ChipUia.psm1, PSScriptAnalyzer severity Error = 0
+      - name: Static checks
+        run: .\windows-agent\test\Test-PowerShellFiles.ps1 -RequireAnalyzer
+
+      - name: Windows hook tests
+        run: .\hooks\test\run-windows.ps1
+
+      # No Claude desktop on the runner: the agent must load and report it cleanly.
+      - name: Agent smoke (-Probe / -Invoke without Claude)
+        run: |
+          $out = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows-agent\chip-remote-agent.ps1 -Probe | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 1 -or $out -notmatch 'not running') { throw "-Probe: unexpected exit $code" }
+          $out = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows-agent\chip-remote-agent.ps1 -Invoke start -Title 'x' | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 1 -or $out -notmatch 'claude_not_running') { throw "-Invoke: unexpected exit $code" }
+          exit 0
