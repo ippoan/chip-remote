@@ -16,10 +16,13 @@ pub trait ChipDriver {
     /// Read-only listing of the chips visible right now. Must never move windows.
     fn list_chips(&self) -> Result<Vec<ChipInfo>, ActionError>;
     /// Raise Claude briefly, find the chip (paging if needed) and press the button.
+    /// `session_title` (from the session file, when known) lets the driver bring that
+    /// session's pane up first.
     fn act(
         &self,
         title: &str,
         tldr: Option<&str>,
+        session_title: Option<&str>,
         action: Action,
         raise_wait: Duration,
     ) -> Result<(), ActionError>;
@@ -44,6 +47,7 @@ enum Request {
     Act {
         title: String,
         tldr: Option<String>,
+        session_title: Option<String>,
         action: Action,
         raise_wait: Duration,
         reply: oneshot::Sender<Result<(), ActionError>>,
@@ -82,6 +86,7 @@ impl DriverHandle {
         &self,
         title: String,
         tldr: Option<String>,
+        session_title: Option<String>,
         action: Action,
         raise_wait: Duration,
     ) -> Result<(), ActionError> {
@@ -90,6 +95,7 @@ impl DriverHandle {
             .send(Request::Act {
                 title,
                 tldr,
+                session_title,
                 action,
                 raise_wait,
                 reply,
@@ -155,12 +161,20 @@ fn serve<F: DriverFactory>(mut factory: F, mut rx: mpsc::UnboundedReceiver<Reque
             Request::Act {
                 title,
                 tldr,
+                session_title,
                 action,
                 raise_wait,
                 reply,
             } => {
-                let r = ensure(&mut factory, &mut driver, &labels)
-                    .and_then(|d| d.act(&title, tldr.as_deref(), action, raise_wait));
+                let r = ensure(&mut factory, &mut driver, &labels).and_then(|d| {
+                    d.act(
+                        &title,
+                        tldr.as_deref(),
+                        session_title.as_deref(),
+                        action,
+                        raise_wait,
+                    )
+                });
                 let _ = reply.send(r);
             }
         }
@@ -174,12 +188,25 @@ pub mod fake {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    /// One recorded `act` call.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ActCall {
+        pub title: String,
+        pub tldr: Option<String>,
+        pub session_title: Option<String>,
+        pub action: Action,
+        pub raise_wait: Duration,
+    }
+
     #[derive(Default)]
     pub struct FakeState {
         pub chips: Vec<ChipInfo>,
         /// Result of the next `act` calls (default Ok).
         pub act_result: Option<ActionError>,
-        pub acts: Vec<(String, Option<String>, Action, Duration)>,
+        pub acts: Vec<ActCall>,
+        /// How long `list_chips` / `act` block the driver thread (a slow / hung UIA).
+        pub list_delay: Duration,
+        pub act_delay: Duration,
         pub lists: usize,
         pub creates: Vec<Labels>,
         pub keep_awake_calls: usize,
@@ -206,6 +233,8 @@ pub mod fake {
 
     impl ChipDriver for FakeDriver {
         fn list_chips(&self) -> Result<Vec<ChipInfo>, ActionError> {
+            let delay = self.0.state().list_delay;
+            std::thread::sleep(delay);
             let mut s = self.0.state();
             s.lists += 1;
             s.threads
@@ -216,16 +245,20 @@ pub mod fake {
             &self,
             title: &str,
             tldr: Option<&str>,
+            session_title: Option<&str>,
             action: Action,
             raise_wait: Duration,
         ) -> Result<(), ActionError> {
+            let delay = self.0.state().act_delay;
+            std::thread::sleep(delay);
             let mut s = self.0.state();
-            s.acts.push((
-                title.to_string(),
-                tldr.map(str::to_string),
+            s.acts.push(ActCall {
+                title: title.to_string(),
+                tldr: tldr.map(str::to_string),
+                session_title: session_title.map(str::to_string),
                 action,
                 raise_wait,
-            ));
+            });
             match &s.act_result {
                 Some(e) => Err(e.clone()),
                 None => Ok(()),
@@ -274,6 +307,7 @@ mod tests {
         h.act(
             "a".into(),
             Some("d".into()),
+            Some("S".into()),
             Action::Start,
             Duration::from_millis(5),
         )
@@ -285,12 +319,13 @@ mod tests {
         assert_eq!(s.threads, vec![Some("chip-uia".to_string())]);
         assert_eq!(
             s.acts,
-            vec![(
-                "a".to_string(),
-                Some("d".to_string()),
-                Action::Start,
-                Duration::from_millis(5)
-            )]
+            vec![ActCall {
+                title: "a".into(),
+                tldr: Some("d".into()),
+                session_title: Some("S".into()),
+                action: Action::Start,
+                raise_wait: Duration::from_millis(5)
+            }]
         );
     }
 
@@ -328,7 +363,7 @@ mod tests {
         let e = h.list_chips().await.unwrap_err();
         assert_eq!(e.code(), "invoke_failed");
         let e = h
-            .act("x".into(), None, Action::Dismiss, Duration::ZERO)
+            .act("x".into(), None, None, Action::Dismiss, Duration::ZERO)
             .await
             .unwrap_err();
         assert_eq!(e.code(), "invoke_failed");
@@ -342,7 +377,7 @@ mod tests {
         fake.state().act_result = Some(ActionError::ButtonNotFound);
         let h = spawn(fake.clone());
         let e = h
-            .act("x".into(), None, Action::Dismiss, Duration::ZERO)
+            .act("x".into(), None, None, Action::Dismiss, Duration::ZERO)
             .await
             .unwrap_err();
         assert_eq!(e, ActionError::ButtonNotFound);

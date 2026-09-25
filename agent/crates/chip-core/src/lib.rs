@@ -3,11 +3,13 @@
 //! - [`config`] — `%APPDATA%\chip-remote\config.json` (same file the PowerShell agent used)
 //! - [`protocol`] — WebSocket messages exchanged with the Worker (docs/PROTOCOL.md)
 //! - [`matching`] — picking the chip that corresponds to a task (title, then tldr)
+//! - [`sessions`] — Claude desktop's session files (pending chips) and their diff
 //! - [`ActionError`] — error codes reported in `action.result`
 
 pub mod config;
 pub mod matching;
 pub mod protocol;
+pub mod sessions;
 
 pub use config::{Config, Labels};
 pub use matching::{normalize, select_chip, ChipInfo};

@@ -7,6 +7,12 @@
 hook は **spawn_task を呼んだ claude が動いているホスト** で発火する。
 普段は SSH 先の mini-ryzen (Linux)、ローカルセッションなら Windows。
 
+> **Rust の Windows agent (`agent/`) が動いているなら hook は不要。** agent が Claude desktop の
+> セッションファイル (`%APPDATA%\Claude\claude-code-sessions`) を監視して、SSH 先のセッションも含め
+> 同じ `POST` / `DELETE /v1/chips` を送る ([`docs/PROTOCOL.md`](../docs/PROTOCOL.md)「Claude desktop のセッションファイル」)。
+> hook を残しても両方冪等なので害は無い (同じ chip が二重に報告されるだけ。先に届いた方の `host` / `cwd` が残る)。
+> hook が要るのは agent を止めている (`watchSessions: false` を含む) ときや、Claude desktop 以外から spawn_task を使うとき。
+
 | ファイル | 用途 |
 |---|---|
 | `post-spawn-task.sh` / `post-dismiss-task.sh` | Linux (bash + jq + curl) |

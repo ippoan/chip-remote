@@ -1,7 +1,9 @@
 //! Lists the chips chip-uia sees in Claude desktop.
 //!
-//!   cargo run -p chip-uia --example probe            read-only (never moves a window)
-//!   cargo run -p chip-uia --example probe -- --raise un-occlude Claude first (moves z-order)
+//!   cargo run -p chip-uia --example probe               read-only (never moves a window)
+//!   cargo run -p chip-uia --example probe -- --sessions also list the sidebar sessions
+//!                                                       (read-only)
+//!   cargo run -p chip-uia --example probe -- --raise    un-occlude Claude first (moves z-order)
 //!
 //! Labels / raiseWaitSec come from %APPDATA%\chip-remote\config.json when present
 //! (url / token are not required here), else the built-in defaults.
@@ -31,8 +33,37 @@ fn load_config() -> Config {
     }
 }
 
+fn print_sidebar(uia: &Uia) {
+    let t0 = Instant::now();
+    match uia.sidebar_sessions() {
+        Ok(list) => {
+            println!();
+            println!(
+                "sidebar sessions: {} ({} ms)",
+                list.len(),
+                t0.elapsed().as_millis()
+            );
+            for (i, s) in list.iter().enumerate() {
+                let title = s.title.as_deref().unwrap_or("<unparsed>");
+                println!(
+                    "  [{:>3}] {title}   <- status {:?}{}",
+                    i + 1,
+                    s.status,
+                    if s.offscreen { " (offscreen)" } else { "" }
+                );
+                if s.title.is_none() {
+                    println!("        name: {}", s.name);
+                }
+            }
+        }
+        Err(e) => eprintln!("sidebar sessions failed: {e}"),
+    }
+}
+
 fn main() -> ExitCode {
-    let raise = std::env::args().skip(1).any(|a| a == "--raise");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raise = args.iter().any(|a| a == "--raise");
+    let sessions = args.iter().any(|a| a == "--sessions");
     let cfg = load_config();
     let uia = match Uia::new(cfg.labels.clone()) {
         Ok(u) => u,
@@ -65,6 +96,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    match uia.shown_sessions() {
+        Ok(s) => println!("shown sessions: {s:?}"),
+        Err(e) => eprintln!("shown sessions failed: {e}"),
+    }
     println!(
         "chips: {} ({} ms{})",
         chips.len(),
@@ -77,6 +112,9 @@ fn main() -> ExitCode {
         println!("    tldr   : {}", c.tldr);
         println!("    buttons: {}", c.buttons.join(" | "));
         println!("    pane_x : {}", c.pane_x);
+    }
+    if sessions {
+        print_sidebar(&uia);
     }
     ExitCode::SUCCESS
 }

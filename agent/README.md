@@ -6,11 +6,18 @@ Claude desktop が動く Windows のログオンセッションに常駐し、Wo
 PowerShell 版 (`windows-agent/`) の置き換えで、プロトコル上の振る舞いは同じ
 (契約は [`docs/PROTOCOL.md`](../docs/PROTOCOL.md))。
 
+- **chip の報告 (hook の代わり)**: Claude desktop のセッションファイル
+  (`%APPDATA%\Claude\claude-code-sessions\…\local_*.json`) を 2 秒ごとに見て、
+  未解決の chip が出たら `POST /v1/chips`、解決・消滅したら `DELETE /v1/chips/:task_id` を Worker に送る
+  (下の「セッションファイルの監視」)
 - `hello` / `chip.new` で届いた `located_pending` の chip を、**画面を動かさずに**
-  `scanIntervalSec` ごとに探す → 見つかれば `chip.located`、`locateTimeoutSec` 経っても無ければ `chip.not_found`
+  `scanIntervalSec` ごとに探す → 見つかれば `chip.located`、`locateTimeoutSec` 経っても無ければ `chip.not_found`。
+  締め切りは UIA の応答を待たずに判定する (UIA が遅くても・action 実行中でも `not_found` は時間どおり出る)
 - `chip.withdrawn` / `action` が来た chip は探索キューから外す
 - `action` → Claude のウィンドウを一時的に前に出して chip を探し (ページ送りも)、ボタンを押して `action.result`
-  (失敗コード `claude_not_running` / `chip_not_found` / `button_not_found` / `invoke_failed`)
+  (失敗コード `claude_not_running` / `chip_not_found` / `button_not_found` / `invoke_failed`)。
+  セッションファイルで知っている chip なら、title / tldr はファイルの値を使い、セッションのタイトルも UIA に渡す。
+  UIA は WS の受信ループとは別に動く (押している間も `ping` や他の chip の処理は止まらない)
 - `ping` → `pong`
 - 切断時は 1 秒から倍々で最大 60 秒待って再接続 (`hello` を受けたセッションの後は 1 秒に戻す)。
   close 4000 (別の agent が接続を奪った) を受けたら `takeoverBackoffSec` 待つ
@@ -35,8 +42,9 @@ PowerShell 版 (`windows-agent/`) の置き換えで、プロトコル上の振�
 
 ## config.json
 
-`%APPDATA%\chip-remote\config.json` (UTF-8、BOM 可)。PowerShell 版・Windows hook と同じファイル・同じキーで、
-新しいキーは無い。接続を張り直すたびに読み直す (値を変えたら次の再接続から有効)。
+`%APPDATA%\chip-remote\config.json` (UTF-8、BOM 可)。PowerShell 版・Windows hook と同じファイル・同じキーに、
+セッションファイル監視の `watchSessions` / `sessionsDir` を足したもの (無ければ既定値)。
+WS 側は接続を張り直すたびに読み直す (値を変えたら次の再接続から有効)。セッションファイル監視は 2 秒ごとに読み直す。
 
 | キー | 既定 | 意味 |
 |---|---|---|
@@ -48,6 +56,26 @@ PowerShell 版 (`windows-agent/`) の置き換えで、プロトコル上の振�
 | `takeoverBackoffSec` | 300 | close 4000 を受けたときの待ち |
 | `raiseWaitSec` | 5 | action 時にウィンドウを前に出してから Chromium の再描画を待つ上限 |
 | `preventSleep` | true | 常駐中はシステムのスリープを止める (`ES_SYSTEM_REQUIRED`、電源設定は変えない)。false→true は次の再接続で効くが、true→false は agent の再起動が必要 |
+| `watchSessions` | true | Claude desktop のセッションファイルを監視して chip を Worker に報告する。false なら報告しない (hook を使う) |
+| `sessionsDir` | (空 = `%APPDATA%\Claude\claude-code-sessions`) | セッションファイルの場所 |
+| `host` | (空 = PC 名) | セッションファイルから報告する chip の `host` (Windows hook と共通のキー) |
+
+## セッションファイルの監視
+
+Claude desktop は Code セッションごとに `local_<uuid>.json` を書き、未解決の chip を
+`backgroundTaskSuggestions`、解決済みを `resolvedBackgroundTaskSuggestions` に持つ
+(フィールドの詳細は [`docs/PROTOCOL.md`](../docs/PROTOCOL.md)「Claude desktop のセッションファイル」)。
+SSH 先 (mini-ryzen) のセッションのファイルもこの PC にあるので、agent 1 つで全部拾える。
+
+- 2 秒ごとに `local_*.json` の (更新時刻, サイズ) を見て、変わったファイルだけ読み直す。
+  書き込み途中で JSON として読めなければ、そのラウンドは前回の内容のまま次で読み直す
+- 起動直後は全ファイルを読み、未解決の chip を全部送る (Worker は既知なら 200 で何もしない)。
+  過去に解決済みの chip は送らない。アーカイブ済みのセッションは chip 無し扱い
+- 新しい chip → `POST /v1/chips`、消えた chip → `DELETE /v1/chips/:task_id` (404 は成功扱い)。
+  スマホの action で agent 自身が押した chip は DELETE しない (結果通知を消さないため)
+- 失敗は 1 秒から倍々 (最大 60 秒) で再送。401/403 も待つ (config.json の token を直せば再起動なしで届く)
+- ログには task_id と HTTP ステータスだけを書く (title / tldr / prompt・token は書かない)
+- hook (`hooks/`) を併用しても冪等なので問題ない。この PC に agent が居れば hook は不要
 
 ## トレイメニュー
 
@@ -99,11 +127,14 @@ WS の送受信は 1 行ずつ残す (長い文字列フィールドは 80 文�
 ```
 agent/
   Cargo.toml              workspace (chip-core / chip-uia / src-tauri)
-  crates/chip-core        config.json・WS メッセージ型・chip の照合 (OS 非依存)
+  crates/chip-core        config.json・WS メッセージ型・chip の照合・セッションファイルの解析と差分 (OS 非依存)
   crates/chip-uia         UI Automation (Claude desktop の chip を探す・押す)
   src-tauri/src/
     lib.rs                トレイ・プラグイン (single-instance / autostart / opener / updater)
     agent.rs              再接続ループ・WS セッション・探索キュー・action (Tauri 非依存でテスト可能)
+    watcher.rs            セッションファイルの監視 (差分 → POST / DELETE)
+    reporter.rs           Worker への HTTP (reqwest + native-tls、再送)
+    book.rs               監視で知った chip (title / tldr / セッションタイトル) を action と共有
     driver.rs             ChipDriver trait + 専用スレッド (UIA の COM は Send でないので 1 スレッドに閉じる)
     uia.rs                ChipDriver の実装 = chip_uia::Uia
     logging.rs / paths.rs / status.rs
@@ -116,7 +147,9 @@ agent/
 cd agent
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace          # WS はプロセス内サーバー、UIA は fake。画面は触らない
+cargo test --workspace          # WS / HTTP はプロセス内サーバー、UIA は fake。画面・本番 Worker は触らない
+# 実機のセッションファイルを読むだけの確認 (件数だけ出す。タイトル等は出さない)
+cargo run -p chip-core --example session_counts
 npm install --no-package-lock
 # 署名鍵なしで NSIS を作る (updater の成果物だけ省く)
 npx tauri build --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}'
@@ -124,5 +157,6 @@ npx tauri build --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}'
 ```
 
 テストは実機の Claude desktop・本番 Worker に触れない (agent のロジックは `agent.rs` の純粋関数と、
-`tokio-tungstenite` のプロセス内サーバー + fake driver で検証する)。
+`tokio-tungstenite` のプロセス内サーバー + fake driver、セッションファイル監視は一時ディレクトリの
+fixture + プロセス内の HTTP サーバーで検証する)。
 実機での確認は `wrangler dev` の Worker に向けた `config.json` で `npx tauri dev` する。

@@ -11,9 +11,14 @@ fn env_dir(var: &str) -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+/// `%APPDATA%` (Roaming): config.json and Claude desktop's session files live under it.
+pub fn appdata_dir() -> PathBuf {
+    env_dir("APPDATA")
+}
+
 /// `%APPDATA%\chip-remote\config.json` (shared with the Windows hooks).
 pub fn config_path() -> PathBuf {
-    Config::default_path(&env_dir("APPDATA"))
+    Config::default_path(&appdata_dir())
 }
 
 /// `%LOCALAPPDATA%\chip-remote` (agent.log, agent.log.1, first-run marker).
@@ -36,7 +41,8 @@ pub const CONFIG_TEMPLATE: &str = r#"{
   "scanIntervalSec": 2,
   "takeoverBackoffSec": 300,
   "raiseWaitSec": 5,
-  "preventSleep": true
+  "preventSleep": true,
+  "watchSessions": true
 }
 "#;
 
@@ -89,6 +95,7 @@ mod tests {
         assert_eq!(c.takeover_backoff_sec, d.takeover_backoff_sec);
         assert_eq!(c.raise_wait_sec, d.raise_wait_sec);
         assert_eq!(c.prevent_sleep, d.prevent_sleep);
+        assert_eq!(c.watch_sessions, d.watch_sessions);
 
         let dir = tmp("tpl");
         let p = dir.join("chip-remote").join("config.json");

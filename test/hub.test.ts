@@ -176,6 +176,25 @@ describe("DELETE /v1/chips/:task_id", () => {
     expect((await getChip(id))?.status).toBe("withdrawn");
   });
 
+  it("done の chip は DELETE で状態を変えず chip_cancel も送らない (phone の結果通知を残す)", async () => {
+    const id = uid();
+    await postChip(id);
+    const ag = await agent();
+    const res = await api(`/v1/chips/${id}/action`, {
+      method: "POST",
+      body: JSON.stringify({ action: "start" }),
+    });
+    const { request_id } = (await res.json()) as { request_id: string };
+    await ag.next("action", (m) => m.task_id === id);
+    ag.sendJson({ type: "action.result", request_id, task_id: id, ok: true });
+    await waitFor(async () => (await getChip(id))?.status === "done");
+
+    const del = await api(`/v1/chips/${id}`, { method: "DELETE" });
+    expect(del.status).toBe(200);
+    expect(((await del.json()) as { chip: { status: string } }).chip.status).toBe("done");
+    expect(sentFor(id).filter((d) => d.type === "chip_cancel")).toHaveLength(0);
+  });
+
   it("未知の task_id は 404", async () => {
     const res = await api(`/v1/chips/${uid()}`, { method: "DELETE" });
     expect(res.status).toBe(404);
