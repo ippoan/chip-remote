@@ -18,7 +18,8 @@ DO は 1 個だけ (`idFromName("hub")`)。個人用なので利用者の概念�
 
 全エンドポイント (`/health` 以外) は `Authorization: Bearer <CHIP_REMOTE_TOKEN>`。
 WebSocket も同じヘッダで upgrade する (PowerShell の `ClientWebSocket.Options.SetRequestHeader` で付けられる)。
-比較は定数時間。token は Worker secret (`wrangler secret put CHIP_REMOTE_TOKEN`)。
+比較は定数時間 (前後の空白・改行は trim)。token は GCP `cloudsql-sv` の `CHIP_REMOTE_TOKEN` が SoT で、
+Worker には CF Secrets Store binding で渡す (secrets-inventory MCP の `sync_from_gcp` で写す)。
 
 ## chip の状態
 
@@ -145,6 +146,9 @@ Group (チャットペインのコンテナ)
     Group
       Text <tldr>
   Button "提案を非表示"               ← dismiss (StatusBar の「兄弟」)
+  Group '' > Button "前の提案を表示"   ┐ 同じセッションに chip が複数あるときだけ出るページ送り。
+  Text   "2件中1番目"                 │ 画面に出るのは現在の 1 件だけで、他の chip は
+  Group '' > Button "次の提案を表示"   ┘ 「次」を押すまで木に存在しない
   Group  "ワークツリーで開始"          ← (同じく兄弟)
     Button "ワークツリーで開始"        ← start (InvokePattern 対応)
     Button "その他の開始オプション"
@@ -152,10 +156,20 @@ Group (チャットペインのコンテナ)
 ```
 
 ボタンは StatusBar の子ではなく、直後に並ぶ兄弟要素 (2026-09-25 の実機で確認)。
-agent は StatusBar の後ろの兄弟を、Button か開始用の Group である間だけたどって、その chip のボタンとして扱う。
+agent は StatusBar の後ろの兄弟を、次の StatusBar か「開始」以外の名前付き Group に当たるまでたどり、
+その chip のボタンとして扱う。目的の chip が見つからなければ「次の提案を表示」でページを送って探す
+(同じタイトルに戻ったら打ち切り、押した後は木の更新を最大 2 秒待つ)。
 
 - 探索範囲は Claude のメインウィンドウ (`claude.exe` の `MainWindowHandle`) の Descendants。
 - Chromium は UIA クライアントを検知してから遅延でアクセシビリティ木を構築するので、
   初回 `FindAll` は title bar の 3 ボタンしか返らない。1〜2 秒待って再取得する。
 - chip は **そのセッションのチャットペインが表示されているときだけ** 木に出る。
   分割ビューに無いセッションの chip は見つからない (v1 は `chip.not_found` で通知だけ出す)。
+- **ウィンドウが他のウィンドウに完全に隠れている / 最小化 / ディスプレイ電源 OFF の間、Chromium は描画を止め、
+  その間に出た chip は木に反映されない。** agent は探す・押す直前に
+  (1) `ES_DISPLAY_REQUIRED` でディスプレイを起こし、(2) Claude のウィンドウを TOPMOST (非アクティブ) にし、
+  (3) 1px 動かして戻す (Chromium は重なり順の変化だけでは再計算しない。位置変更イベントで ~0.3 秒で再描画)。
+  終わったら TOPMOST を外して元の前面ウィンドウの後ろに戻す。
+- ボタンを InvokePattern で押すと Chromium がフォーカスを移すため、**Claude のウィンドウがアクティブになる**。
+- 画面ロック中は対象外 (描画されない)。agent は常駐中 `ES_SYSTEM_REQUIRED` でスリープだけ防ぐ
+  (電源設定は変えない。ノート PC の蓋を閉じた場合は防げない)。
