@@ -92,6 +92,8 @@ jobs:
           ./gradlew assembleRelease
           mkdir -p dist
           cp app/build/outputs/apk/release/app-release.apk dist/chip-remote.apk
+          # versionCode / versionName は AGP が書く output-metadata.json から取る (version.json 用)
+          cp app/build/outputs/apk/release/output-metadata.json dist/output-metadata.json
 
       - name: Build debug APK
         if: steps.keystore.outputs.signed != 'true'
@@ -99,6 +101,7 @@ jobs:
           ./gradlew assembleDebug
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk dist/chip-remote.apk
+          cp app/build/outputs/apk/debug/output-metadata.json dist/output-metadata.json
 
       - uses: actions/upload-artifact@v4
         with:
@@ -127,19 +130,26 @@ jobs:
       # スマホからの DL は GitHub Pages から (Release の asset は署名付き URL へのリダイレクトで、
       # Android のブラウザ → DownloadManager の受け渡しで止まることがある。AlcoholChecker と同じ配布方式)。
       # https://ippoan.github.io/chip-remote/chip-remote.apk
+      # version.json はアプリの自己更新 (UpdateChecker) が 6 時間ごとに見る。APK と同じコミットで置く。
       - name: Publish APK to GitHub Pages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
-          sha256sum dist/chip-remote.apk | cut -d' ' -f1 > dist/chip-remote.apk.sha256
-          cp dist/chip-remote.apk dist/chip-remote.apk.sha256 "$RUNNER_TEMP/"
+          sha=$(sha256sum dist/chip-remote.apk | cut -d' ' -f1)
+          echo "$sha" > dist/chip-remote.apk.sha256
+          jq -e --arg sha "$sha" --arg apk "https://ippoan.github.io/chip-remote/chip-remote.apk" '
+            .elements[0] | {versionCode: .versionCode, versionName: .versionName, apk: $apk, sha256: $sha}
+            | select((.versionCode | type) == "number" and .versionCode > 0)
+          ' dist/output-metadata.json > dist/version.json
+          cat dist/version.json
+          cp dist/chip-remote.apk dist/chip-remote.apk.sha256 dist/version.json "$RUNNER_TEMP/"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch --depth=1 origin gh-pages
           git worktree add "$RUNNER_TEMP/pages" origin/gh-pages
           cd "$RUNNER_TEMP/pages"
-          cp "$RUNNER_TEMP/chip-remote.apk" "$RUNNER_TEMP/chip-remote.apk.sha256" .
-          git add chip-remote.apk chip-remote.apk.sha256
+          cp "$RUNNER_TEMP/chip-remote.apk" "$RUNNER_TEMP/chip-remote.apk.sha256" "$RUNNER_TEMP/version.json" .
+          git add chip-remote.apk chip-remote.apk.sha256 version.json
           git commit -m "android: ${GITHUB_SHA::7} (run ${GITHUB_RUN_NUMBER})" || { echo "no change"; exit 0; }
           for attempt in 1 2 3; do
             git push origin HEAD:gh-pages && exit 0

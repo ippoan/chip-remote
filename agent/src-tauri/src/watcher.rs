@@ -10,17 +10,24 @@
 //!   except when the chip left because the agent pressed it for the phone (the Worker
 //!   already has the result).
 //! - [`ChipBook`] gets the file's exact title / tldr and the session title for actions.
+//! - after every complete round (directory present and fully listed, every file parsed
+//!   at least once) [`ChipBook`] gets a [`SessionIndex`] of all files; the first complete
+//!   round of a watch (the full scan) also reconciles the Worker's last `hello` against
+//!   it ([`crate::reconcile`]). Watching off / another directory → no index.
 //! - config.json is re-read every round (`watchSessions`, `sessionsDir`, url / token).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use chip_core::sessions::{diff, is_session_file_name, parse_session, ChipEvent, SessionChips};
+use chip_core::sessions::{
+    diff, is_session_file_name, parse_session, ChipEvent, SessionChips, SessionIndex,
+};
 use chip_core::Config;
 
 use crate::book::{BookEntry, ChipBook};
-use crate::reporter::{self, Job, NewChip, RetryPolicy};
+use crate::reconcile::now_ms;
+use crate::reporter::{self, Job, NewChip, RetryPolicy, Withdrawer};
 
 /// `<id>\<id>\local_*.json`; a little slack for layout changes.
 const MAX_DEPTH: usize = 4;
@@ -43,6 +50,10 @@ pub struct Poll {
     pub files: usize,
     pub parsed: usize,
     pub failed: usize,
+    /// The directory exists, was listed completely and every file in it has a snapshot:
+    /// [`SessionWatch::index`] reflects all sessions (a chip missing from it really is
+    /// in no file).
+    pub complete: bool,
 }
 
 /// Snapshot of one sessions directory (pure file I/O; no network).
@@ -51,6 +62,8 @@ pub struct SessionWatch {
     files: HashMap<PathBuf, FileEntry>,
     warned: HashSet<PathBuf>,
     dir_missing_logged: bool,
+    /// Had a complete round ([`Poll::complete`]).
+    ready: bool,
 }
 
 /// Collects `local_*.json` files; false when some directory could not be read (then a
@@ -91,7 +104,13 @@ impl SessionWatch {
             files: HashMap::new(),
             warned: HashSet::new(),
             dir_missing_logged: false,
+            ready: false,
         }
+    }
+
+    /// Pending / resolved chips of every file as of the last poll.
+    pub fn index(&self) -> SessionIndex {
+        SessionIndex::from_sessions(self.files.values().map(|e| &e.chips))
     }
 
     pub fn dir(&self) -> &Path {
@@ -172,6 +191,7 @@ impl SessionWatch {
                 }
                 self.warned.remove(&p);
             }
+            out.complete = seen.iter().all(|(p, _)| self.files.contains_key(p));
         }
         out
     }
@@ -184,6 +204,8 @@ pub struct WatchEnv {
     pub book: ChipBook,
     pub poll: Duration,
     pub retry: RetryPolicy,
+    /// DELETEs decided by the reconcile.
+    pub withdraw: Withdrawer,
 }
 
 /// Applies one round's events: book updates and Worker reports (in order).
@@ -250,6 +272,7 @@ pub async fn run_forever(env: WatchEnv) {
             Ok(cfg) if !cfg.watch_sessions => {
                 if watch.take().is_some() {
                     tracing::info!("sessions: watching turned off (watchSessions=false)");
+                    env.book.set_index(None);
                 }
             }
             Ok(cfg) => {
@@ -258,6 +281,8 @@ pub async fn run_forever(env: WatchEnv) {
                     Some(w) if w.dir() == dir => w,
                     _ => {
                         tracing::info!("sessions: watching {}", dir.display());
+                        // Another directory: the old index says nothing about it.
+                        env.book.set_index(None);
                         SessionWatch::new(dir)
                     }
                 };
@@ -268,7 +293,7 @@ pub async fn run_forever(env: WatchEnv) {
                 })
                 .await;
                 match joined {
-                    Ok((w, poll)) => {
+                    Ok((mut w, poll)) => {
                         if first && poll.files > 0 {
                             tracing::info!(
                                 "sessions: full scan: {} file(s), {} parsed, {} skipped, {} pending chip(s)",
@@ -277,6 +302,28 @@ pub async fn run_forever(env: WatchEnv) {
                                 poll.failed,
                                 poll.refreshed.len()
                             );
+                        }
+                        if poll.complete {
+                            // Before apply(): its deliveries may sit in a retry backoff.
+                            let full_scan = !w.ready;
+                            w.ready = true;
+                            let index = w.index();
+                            if full_scan {
+                                tracing::info!(
+                                    "sessions: index ready: {} pending, {} resolved",
+                                    index.pending_len(),
+                                    index.resolved_len()
+                                );
+                            }
+                            env.book.set_index(Some(index));
+                            if full_scan {
+                                for id in env.book.reconcile_last_hello(now_ms()) {
+                                    env.withdraw.withdraw(
+                                        id,
+                                        "open on the Worker, resolved / gone on the PC",
+                                    );
+                                }
+                            }
                         }
                         watch = Some(w);
                         apply(poll, &env, &cfg, &client).await;
@@ -293,6 +340,7 @@ pub async fn run_forever(env: WatchEnv) {
 mod tests {
     use super::*;
     use crate::reporter::fake_http::{self, FakeHttp};
+    use chip_core::sessions::Presence;
     use serde_json::json;
 
     struct TempDir(PathBuf);
@@ -363,6 +411,7 @@ mod tests {
 
         let p = w.poll();
         assert_eq!((p.files, p.parsed, p.failed), (2, 2, 0));
+        assert!(p.complete);
         assert_eq!(p.events.len(), 1);
         assert!(
             matches!(&p.events[0], ChipEvent::Appeared { chip, .. } if chip.task_id == "task_1")
@@ -387,6 +436,8 @@ mod tests {
         std::fs::write(&a, "{\"title\":\"S1\",\"backgroundTask").unwrap();
         let p = w.poll();
         assert_eq!((p.failed, p.events.len()), (1, 0));
+        assert!(p.complete, "the old snapshot still counts");
+        assert_eq!(w.index().presence("task_1"), Presence::Pending);
 
         // Complete write: task_1 started, task_2 new.
         std::fs::write(
@@ -418,6 +469,40 @@ mod tests {
         let mut w = SessionWatch::new(tmp.0.join("nope"));
         let p = w.poll();
         assert_eq!((p.files, p.events.len()), (0, 0));
+        assert!(
+            !p.complete,
+            "no directory: no index (everything would look absent)"
+        );
+    }
+
+    /// A file never read yet (caught mid-write on the first round) leaves the index
+    /// incomplete: its chips would look absent to the reconcile.
+    #[test]
+    fn index_is_complete_only_when_every_file_was_read() {
+        let tmp = TempDir::new("complete");
+        let a = write(&tmp.0, "local_a.json", "{\"title\":\"S1\",\"backgroundTask");
+        write(
+            &tmp.0,
+            "local_b.json",
+            &session_json("S2", &[("task_2", "T2")], &[("task_0", "dismissed")]),
+        );
+        let mut w = SessionWatch::new(tmp.0.clone());
+        let p = w.poll();
+        assert_eq!((p.parsed, p.failed), (1, 1));
+        assert!(!p.complete);
+        std::fs::write(&a, session_json("S1", &[("task_1", "T1")], &[])).unwrap();
+        let p = w.poll();
+        assert!(p.complete);
+        let idx = w.index();
+        assert_eq!(idx.presence("task_1"), Presence::Pending);
+        assert_eq!(idx.presence("task_2"), Presence::Pending);
+        assert_eq!(
+            idx.presence("task_0"),
+            Presence::Resolved(chip_core::sessions::Resolution::Dismissed)
+        );
+        // An empty (but present) directory is complete: nothing is pending anywhere.
+        let empty = TempDir::new("empty");
+        assert!(SessionWatch::new(empty.0.clone()).poll().complete);
     }
 
     fn env(tmp: &TempDir, srv: &FakeHttp, book: &ChipBook) -> WatchEnv {
@@ -428,15 +513,17 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
+        let retry = RetryPolicy {
+            initial: Duration::from_millis(5),
+            max: Duration::from_millis(20),
+        };
         WatchEnv {
-            config_path: cfg,
+            config_path: cfg.clone(),
             appdata: tmp.0.clone(),
             book: book.clone(),
             poll: Duration::from_millis(20),
-            retry: RetryPolicy {
-                initial: Duration::from_millis(5),
-                max: Duration::from_millis(20),
-            },
+            retry,
+            withdraw: Withdrawer::new(cfg, retry),
         }
     }
 
@@ -501,6 +588,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(srv.requests().len(), 4, "no DELETE for our own action");
         assert!(book.is_empty());
+        assert!(book.is_ours("task_1"));
+        assert_eq!(
+            book.presence("task_2"),
+            Some(Presence::Resolved(
+                chip_core::sessions::Resolution::Dismissed
+            )),
+            "the book's index follows every complete round"
+        );
         task.abort();
     }
 

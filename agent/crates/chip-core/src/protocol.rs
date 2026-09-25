@@ -12,6 +12,9 @@ pub struct WireChip {
     pub tldr: String,
     #[serde(default)]
     pub status: String,
+    /// When the Worker first saw the chip (ms since epoch; 0 when not sent).
+    #[serde(default)]
+    pub created_at: i64,
 }
 
 /// Worker → agent.
@@ -91,7 +94,7 @@ mod tests {
 
     #[test]
     fn parses_server_messages() {
-        let m = ServerMsg::parse(r#"{"type":"hello","chips":[{"task_id":"task_1","title":"t","tldr":"d","status":"located_pending","located":false,"extra":1}]}"#).unwrap();
+        let m = ServerMsg::parse(r#"{"type":"hello","chips":[{"task_id":"task_1","title":"t","tldr":"d","status":"located_pending","located":false,"created_at":1790000000123,"extra":1}]}"#).unwrap();
         assert_eq!(
             m,
             ServerMsg::Hello {
@@ -99,7 +102,8 @@ mod tests {
                     task_id: "task_1".into(),
                     title: "t".into(),
                     tldr: "d".into(),
-                    status: "located_pending".into()
+                    status: "located_pending".into(),
+                    created_at: 1790000000123,
                 }]
             }
         );

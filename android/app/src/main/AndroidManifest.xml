@@ -4,6 +4,8 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 自己更新 (Updater)。初回だけ「不明なアプリのインストール」をユーザーが許可する -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name=".ChipRemoteApp"
@@ -33,6 +35,11 @@
 
         <receiver
             android:name=".ActionReceiver"
+            android:exported="false" />
+
+        <!-- PackageInstaller セッションの結果 (明示 PendingIntent で届くので export 不要) -->
+        <receiver
+            android:name=".InstallResultReceiver"
             android:exported="false" />
 
         <!-- google-services.json を使わず ChipRemoteApp で手動初期化するので、自動初期化の provider を外す。

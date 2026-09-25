@@ -14,12 +14,17 @@
 //!   scan), pongs or other messages
 //! - an `action` for a chip the session-file watcher knows ([`ChipBook`]) uses the file's
 //!   exact title / tldr and passes the session title to the driver
+//! - `hello` also reconciles the Worker's open chips with the session files
+//!   ([`crate::reconcile`]): chips already resolved on the PC (or in no file for 10 min)
+//!   are DELETEd. An `action` for a chip resolved on the PC does not touch the UI:
+//!   `chip_not_found` + DELETE (unless the agent itself pressed it)
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use chip_core::protocol::{Action, ClientMsg, ServerMsg, WireChip, CLOSE_REPLACED};
+use chip_core::sessions::Presence;
 use chip_core::{select_chip, ActionError, ChipInfo, Config};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -34,6 +39,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::book::ChipBook;
 use crate::driver::DriverHandle;
 use crate::logging::log_view;
+use crate::reconcile::now_ms;
+use crate::reporter::Withdrawer;
 use crate::status::{Status, StatusSink};
 
 /// Retry interval while config.json is missing / incomplete.
@@ -169,6 +176,8 @@ impl Locator {
 #[derive(Debug, PartialEq)]
 pub enum Step {
     Nothing,
+    /// `hello`: the Worker's open chips, to reconcile with the session files.
+    Hello(Vec<WireChip>),
     Reply(ClientMsg),
     Act {
         request_id: String,
@@ -196,7 +205,7 @@ pub fn on_text(
         ServerMsg::Hello { chips } => {
             loc.resync(&chips, now, locate_timeout);
             *hello_received = true;
-            Step::Nothing
+            Step::Hello(chips)
         }
         ServerMsg::ChipNew { chip } => {
             loc.add(&chip, now, locate_timeout);
@@ -348,11 +357,37 @@ impl ScanLog {
     }
 }
 
+/// `action.result` without touching the UI when the session files say the chip is
+/// already resolved on the PC (the UI cannot have it any more). Also DELETEs it so it
+/// leaves the phone, unless the agent pressed it itself (the Worker has that result).
+pub fn resolved_elsewhere(
+    book: &ChipBook,
+    withdraw: &Withdrawer,
+    request_id: &str,
+    task_id: &str,
+    action: Action,
+) -> Option<ClientMsg> {
+    let Some(Presence::Resolved(r)) = book.presence(task_id) else {
+        return None;
+    };
+    tracing::info!("action {action:?} {task_id}: already resolved on the PC ({r:?}); UI untouched");
+    if !book.is_ours(task_id) {
+        withdraw.withdraw(task_id.to_string(), "action for a chip resolved on the PC");
+    }
+    Some(ClientMsg::ActionResult {
+        request_id: request_id.to_string(),
+        task_id: task_id.to_string(),
+        ok: false,
+        error: Some(ActionError::ChipNotFound.code().to_string()),
+    })
+}
+
 /// Runs one connected session until the socket closes or fails.
 pub async fn run_session<S>(
     ws: &mut WebSocketStream<S>,
     driver: &DriverHandle,
     book: &ChipBook,
+    withdraw: &Withdrawer,
     p: &SessionParams,
 ) -> SessionEnd
 where
@@ -387,15 +422,27 @@ where
                             tracing::info!("< {}", log_view(&text));
                             match on_text(&mut loc, &text, Instant::now(), p.locate_timeout, &mut end.hello_received) {
                                 Step::Nothing => {}
+                                Step::Hello(chips) => {
+                                    if !book.has_index() {
+                                        tracing::info!("reconcile: waiting for the first full scan of the session files");
+                                    }
+                                    for id in book.on_hello(chips, now_ms()) {
+                                        withdraw.withdraw(id, "open on the Worker, resolved / gone on the PC");
+                                    }
+                                }
                                 Step::Reply(m) => send(ws, &m).await?,
                                 Step::Act { request_id, task_id, title, tldr, action } => {
-                                    let (title, tldr, session) = action_target(book, &task_id, title, tldr);
-                                    book.mark_acting(&task_id);
-                                    let (d, tx, raise_wait) = (driver.clone(), done_tx.clone(), p.raise_wait);
-                                    tokio::spawn(async move {
-                                        let result = d.act(title, tldr, session, action, raise_wait).await;
-                                        let _ = tx.send(Done::Act { request_id, task_id, action, result });
-                                    });
+                                    if let Some(m) = resolved_elsewhere(book, withdraw, &request_id, &task_id, action) {
+                                        send(ws, &m).await?;
+                                    } else {
+                                        let (title, tldr, session) = action_target(book, &task_id, title, tldr);
+                                        book.mark_acting(&task_id);
+                                        let (d, tx, raise_wait) = (driver.clone(), done_tx.clone(), p.raise_wait);
+                                        tokio::spawn(async move {
+                                            let result = d.act(title, tldr, session, action, raise_wait).await;
+                                            let _ = tx.send(Done::Act { request_id, task_id, action, result });
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -504,6 +551,8 @@ pub struct AgentEnv {
     pub status: StatusSink,
     /// Chips known from the session files (filled by the watcher).
     pub book: ChipBook,
+    /// DELETEs decided by the reconcile.
+    pub withdraw: Withdrawer,
 }
 
 /// The agent's main loop. Never returns.
@@ -535,7 +584,7 @@ pub async fn run_forever(env: AgentEnv) {
             Ok(mut ws) => {
                 tracing::info!("connected");
                 (env.status)(Status::Connected);
-                run_session(&mut ws, &env.driver, &env.book, &params).await
+                run_session(&mut ws, &env.driver, &env.book, &env.withdraw, &params).await
             }
             Err(e) => {
                 tracing::warn!("connect failed: {e}");
@@ -565,6 +614,10 @@ mod tests {
     use crate::book::BookEntry;
     use crate::driver::fake::{chip, ActCall, Fake};
     use crate::driver::spawn;
+    use crate::reconcile::ABSENT_GRACE_MS;
+    use crate::reporter::fake_http::{self, FakeHttp};
+    use crate::reporter::RetryPolicy;
+    use chip_core::sessions::{parse_session, SessionIndex};
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
@@ -578,6 +631,7 @@ mod tests {
             title: title.into(),
             tldr: String::new(),
             status: status.into(),
+            created_at: 0,
         }
     }
 
@@ -598,7 +652,7 @@ mod tests {
         ]})
         .to_string();
         let step = on_text(&mut loc, &text, now, Duration::from_secs(5), &mut hello);
-        assert_eq!(step, Step::Nothing);
+        assert!(matches!(&step, Step::Hello(c) if c.len() == 5), "{step:?}");
         assert!(hello);
         assert_eq!(loc.task_ids(), vec!["a".to_string(), "d".to_string()]);
     }
@@ -825,13 +879,34 @@ mod tests {
         p: SessionParams,
         book: ChipBook,
     ) -> (ServerWs, tokio::task::JoinHandle<SessionEnd>) {
+        // No config: a DELETE would wait forever (none is expected in these tests).
+        let withdraw = Withdrawer::new(PathBuf::from("does-not-exist.json"), fast_retry());
+        start_full(fake, p, book, withdraw).await
+    }
+
+    async fn start_full(
+        fake: &Fake,
+        p: SessionParams,
+        book: ChipBook,
+        withdraw: Withdrawer,
+    ) -> (ServerWs, tokio::task::JoinHandle<SessionEnd>) {
         let srv = server().await;
         let driver = spawn(fake.clone());
         let mut client = connect(&srv.cfg).await.unwrap();
         let (ws, auth) = srv.accepted.await.unwrap();
         assert_eq!(auth.as_deref(), Some("Bearer secret-token"));
-        let task = tokio::spawn(async move { run_session(&mut client, &driver, &book, &p).await });
+        let task =
+            tokio::spawn(
+                async move { run_session(&mut client, &driver, &book, &withdraw, &p).await },
+            );
         (ws, task)
+    }
+
+    fn fast_retry() -> RetryPolicy {
+        RetryPolicy {
+            initial: Duration::from_millis(5),
+            max: Duration::from_millis(20),
+        }
     }
 
     async fn push(ws: &mut ServerWs, v: Value) {
@@ -1236,6 +1311,7 @@ mod tests {
                 let _ = st_tx.send(s);
             }),
             book: ChipBook::default(),
+            withdraw: Withdrawer::new(PathBuf::from("does-not-exist.json"), fast_retry()),
         };
         let agent = tokio::spawn(run_forever(env));
         let (mut ws, auth) = srv.accepted.await.unwrap();
@@ -1268,6 +1344,7 @@ mod tests {
                 let _ = st_tx.send(s);
             }),
             book: ChipBook::default(),
+            withdraw: Withdrawer::new(PathBuf::from("does-not-exist.json"), fast_retry()),
         };
         let t0 = Instant::now();
         let agent = tokio::spawn(run_forever(env));
@@ -1300,5 +1377,219 @@ mod tests {
         let e = connect(&cfg).await.unwrap_err();
         assert!(e.contains("401"), "{e}");
         assert!(!e.contains("secret-token"));
+    }
+
+    // ---------------- reconcile with the session files (Worker HTTP faked too)
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            let n = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let p = std::env::temp_dir().join(format!(
+                "chip-remote-agent-{tag}-{}-{n}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// config.json pointing at the fake Worker (sessions under `<tmp>/sessions`).
+    fn worker_config(tmp: &TempDir, srv: &FakeHttp) -> PathBuf {
+        let p = tmp.0.join("config.json");
+        std::fs::write(
+            &p,
+            json!({"url": srv.url, "token": "secret-token", "sessionsDir": tmp.0.join("sessions"), "host": "PC1"})
+                .to_string(),
+        )
+        .unwrap();
+        p
+    }
+
+    const SESSION: &str = r#"{"title":"S","cliSessionId":"cli-1","cwd":"C:\\w",
+        "backgroundTaskSuggestions":[{"id":"task_p","title":"P","tldr":"p"}],
+        "resolvedBackgroundTaskSuggestions":{"task_r":"dismissed","task_m":"started_notified","task_a":"started_notified"}}"#;
+
+    fn session_index() -> SessionIndex {
+        SessionIndex::from_sessions([&parse_session(SESSION).unwrap()])
+    }
+
+    async fn wait_requests(srv: &FakeHttp, n: usize) -> Vec<fake_http::Recorded> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let r = srv.requests();
+                if r.len() >= n {
+                    return r;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected requests to the fake Worker")
+    }
+
+    fn deletes(r: &[fake_http::Recorded]) -> Vec<String> {
+        let mut v: Vec<String> = r
+            .iter()
+            .filter(|x| x.method == "DELETE")
+            .map(|x| x.path.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The bug: chips resolved on the PC while nobody reported it stayed open on the
+    /// Worker forever (the phone's 未処理 list; an action → chip_not_found → failed,
+    /// still open). hello now DELETEs them.
+    #[tokio::test]
+    async fn hello_withdraws_chips_resolved_on_the_pc() {
+        let tmp = TempDir::new("hello-rec");
+        let srv = fake_http::start().await;
+        let withdraw = Withdrawer::new(worker_config(&tmp, &srv), fast_retry());
+        let book = ChipBook::default();
+        book.set_index(Some(session_index()));
+        // task_m was started by our own action.
+        book.mark_acting("task_m");
+        assert!(book.take_acting("task_m"));
+        let (mut ws, task) = start_full(&Fake::default(), fast(), book, withdraw).await;
+        let now = now_ms();
+        push(
+            &mut ws,
+            json!({"type":"hello","chips":[
+                {"task_id":"task_r","title":"R","status":"failed","created_at": now},
+                {"task_id":"task_p","title":"P","status":"notified","created_at": now - ABSENT_GRACE_MS * 3},
+                {"task_id":"task_old","title":"O","status":"notified","created_at": now - ABSENT_GRACE_MS - 1000},
+                {"task_id":"task_young","title":"Y","status":"notified","created_at": now - 1000},
+                {"task_id":"task_a","title":"A","status":"acting","created_at": now},
+                {"task_id":"task_m","title":"M","status":"failed","created_at": now}
+            ]}),
+        )
+        .await;
+        let r = wait_requests(&srv, 2).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r2 = srv.requests();
+        assert_eq!(r2.len(), 2, "{r2:?}");
+        assert_eq!(deletes(&r), vec!["/v1/chips/task_old", "/v1/chips/task_r"]);
+        assert!(r
+            .iter()
+            .all(|x| x.auth.as_deref() == Some("Bearer secret-token")));
+        // A second hello does not DELETE them again.
+        push(
+            &mut ws,
+            json!({"type":"hello","chips":[{"task_id":"task_young","status":"notified","created_at": now - 1000}]}),
+        )
+        .await;
+        push(&mut ws, json!({"type":"ping"})).await;
+        assert_eq!(expect_json(&mut ws).await, json!({"type":"pong"}));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(srv.requests().len(), 2);
+        ws.close(None).await.unwrap();
+        task.await.unwrap();
+    }
+
+    /// hello before the watcher's first full scan: reconciled right after that scan.
+    #[tokio::test]
+    async fn hello_before_the_first_scan_is_reconciled_after_it() {
+        let tmp = TempDir::new("hello-first");
+        let srv = fake_http::start().await;
+        let config_path = worker_config(&tmp, &srv);
+        let withdraw = Withdrawer::new(config_path.clone(), fast_retry());
+        let book = ChipBook::default();
+        let (mut ws, task) =
+            start_full(&Fake::default(), fast(), book.clone(), withdraw.clone()).await;
+        push(
+            &mut ws,
+            json!({"type":"hello","chips":[
+                {"task_id":"task_r","title":"R","status":"notified","created_at": now_ms()},
+                {"task_id":"task_p","title":"P","status":"notified","created_at": 1}
+            ]}),
+        )
+        .await;
+        push(&mut ws, json!({"type":"ping"})).await;
+        assert_eq!(expect_json(&mut ws).await, json!({"type":"pong"}));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(srv.requests().is_empty(), "no index yet: nothing decided");
+
+        let dir = tmp.0.join("sessions").join("acct").join("org");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("local_a.json"), SESSION).unwrap();
+        let watcher = tokio::spawn(crate::watcher::run_forever(crate::watcher::WatchEnv {
+            config_path,
+            appdata: tmp.0.clone(),
+            book: book.clone(),
+            poll: Duration::from_millis(20),
+            retry: fast_retry(),
+            withdraw,
+        }));
+        let r = wait_requests(&srv, 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let r2 = srv.requests();
+        assert_eq!(r2.len(), 2, "{r2:?}");
+        // The full scan POSTs the pending chip and DELETEs the resolved one.
+        assert_eq!(deletes(&r), vec!["/v1/chips/task_r"]);
+        assert!(r
+            .iter()
+            .any(|x| x.method == "POST" && x.body.contains("\"task_p\"")));
+        watcher.abort();
+        ws.close(None).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn action_for_a_chip_resolved_on_the_pc_skips_the_ui_and_withdraws() {
+        let tmp = TempDir::new("act-rec");
+        let srv = fake_http::start().await;
+        let withdraw = Withdrawer::new(worker_config(&tmp, &srv), fast_retry());
+        let book = ChipBook::default();
+        book.set_index(Some(session_index()));
+        book.mark_acting("task_m");
+        assert!(book.take_acting("task_m"));
+        let fake = Fake::default();
+        let (mut ws, task) = start_full(&fake, fast(), book, withdraw).await;
+        push(
+            &mut ws,
+            json!({"type":"action","request_id":"r1","task_id":"task_r","action":"dismiss","title":"R"}),
+        )
+        .await;
+        assert_eq!(
+            expect_json(&mut ws).await,
+            json!({"type":"action.result","request_id":"r1","task_id":"task_r","ok":false,"error":"chip_not_found"})
+        );
+        let r = wait_requests(&srv, 1).await;
+        assert_eq!(deletes(&r), vec!["/v1/chips/task_r"]);
+        // Resolved by our own action: same answer, but never DELETEd.
+        push(
+            &mut ws,
+            json!({"type":"action","request_id":"r2","task_id":"task_m","action":"start","title":"M"}),
+        )
+        .await;
+        assert_eq!(
+            expect_json(&mut ws).await,
+            json!({"type":"action.result","request_id":"r2","task_id":"task_m","ok":false,"error":"chip_not_found"})
+        );
+        // Pending in the file: the UI is used as before.
+        push(
+            &mut ws,
+            json!({"type":"action","request_id":"r3","task_id":"task_p","action":"start","title":"P"}),
+        )
+        .await;
+        assert_eq!(expect_json(&mut ws).await["ok"], true);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(srv.requests().len(), 1);
+        {
+            let s = fake.state();
+            assert_eq!(s.acts.len(), 1, "only task_p reached the UI");
+            assert_eq!(s.acts[0].title, "P");
+        }
+        ws.close(None).await.unwrap();
+        task.await.unwrap();
     }
 }

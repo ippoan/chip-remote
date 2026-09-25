@@ -11,6 +11,9 @@ class ChipRemoteApp : Application() {
         super.onCreate()
         firebaseReady = initFirebase()
         Notifier.ensureChannel(this)
+        UpdateChecker.ensureChannel(this)
+        // 初回登録時にすぐ 1 回走り、以後 6 時間ごと (アプリを開かなくても更新通知が出る)
+        UpdateChecker.schedule(this)
     }
 
     /** BuildConfig の値から FirebaseApp を手動で作る。値が欠けていれば false (FCM 無しで動く)。 */

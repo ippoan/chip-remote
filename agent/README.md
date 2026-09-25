@@ -50,6 +50,7 @@ WS 側は接続を張り直すたびに読み直す (値を変えたら次の再
 | `url` | (必須) | Worker の origin。`https→wss` / `http→ws` に変えて `/v1/agent/ws` へ。`wrangler dev` なら `http://localhost:8787` |
 | `token` | (必須) | `CHIP_REMOTE_TOKEN`。upgrade 時に `Authorization: Bearer` で送る。ログには出さない |
 | `labels.marker` / `start` / `dismiss` / `next` | `推奨タスク` / `ワークツリーで開始` / `提案を非表示` / `次の提案を表示` | Claude desktop の UI ラベル (UI 言語に合わせる) |
+| `labels.startSuffix` | `開始` | 名前がこれで終わるボタンも「開始」とみなす (SSH セッションは `mini-ryzen-claudeでworktreeを使って開始`)。空で無効 |
 | `locateTimeoutSec` | 5 | 画面を動かさない探索で `chip.not_found` を返すまでの秒数 |
 | `scanIntervalSec` | 2 | 探索の間隔 (最小 1) |
 | `takeoverBackoffSec` | 300 | close 4000 を受けたときの待ち |
