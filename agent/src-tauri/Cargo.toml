@@ -40,6 +40,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "local-time"] }
 # 「ログをコピー」。AlcAppTauri と同じく tauri-plugin-clipboard より依存が薄い arboard。
 arboard = "3"
+# 「スマホ接続用 QR を表示」: 接続コードの QR を SVG で作る (image 系の依存は不要)。
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "test-util"] }

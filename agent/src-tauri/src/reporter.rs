@@ -3,16 +3,24 @@
 //! `DELETE /v1/chips/:task_id` (404 = already unknown, fine). Both are idempotent, so
 //! the hooks may keep reporting the same chips.
 //!
-//! Every attempt re-reads config.json (a fixed token / url takes effect without a
-//! restart). Network errors, 5xx, 408, 429 and 401 / 403 are retried with a backoff
-//! (1 → 2 → … → 60 s); other 4xx give up. The token is never logged.
+//! Every attempt re-reads config.json (a fixed token / url / Access service token takes
+//! effect without a restart). Network errors, 5xx, 408, 429 and 401 / 403 are retried
+//! with a backoff (1 → 2 → … → 60 s); other 4xx give up. The token and the Access
+//! secret are never logged.
+//!
+//! Cloudflare Access (docs/PROTOCOL.md 「認証」): `CF-Access-Client-Id` /
+//! `CF-Access-Client-Secret` go with every request when both are configured. Redirects
+//! are not followed, so Access sending us to its login page (or answering 401 / 403
+//! itself) is recognised, logged as [`ACCESS_DENIED_MESSAGE`] and retried.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chip_core::access::{is_access_rejection, ACCESS_DENIED_MESSAGE};
 use chip_core::Config;
+use reqwest::header::{HeaderValue, CONTENT_TYPE, LOCATION};
 use reqwest::Client;
 use serde_json::json;
 
@@ -98,6 +106,8 @@ pub fn client() -> Client {
     Client::builder()
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(10))
+        // An Access login redirect must surface as a 3xx, not as the login page's 200.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|e| {
             tracing::warn!("http client: {e}; using defaults");
@@ -105,7 +115,7 @@ pub fn client() -> Client {
         })
 }
 
-/// One attempt. Ok(status) or Err(reason without the token).
+/// One attempt. Ok(status) or Err(reason without the token / Access secret).
 async fn attempt(client: &Client, cfg: &Config, job: &Job) -> Result<u16, String> {
     let base = cfg.url.trim_end_matches('/');
     let req = match job {
@@ -119,8 +129,26 @@ async fn attempt(client: &Client, cfg: &Config, job: &Job) -> Result<u16, String
         })),
         Job::Delete(id) => client.delete(format!("{base}/v1/chips/{id}")),
     };
-    match req.bearer_auth(&cfg.token).send().await {
-        Ok(resp) => Ok(resp.status().as_u16()),
+    let mut req = req.bearer_auth(&cfg.token);
+    if let Some(pairs) = cfg.access_headers() {
+        for (name, value) in pairs {
+            let mut v = HeaderValue::from_str(value)
+                .map_err(|_| format!("{name} contains characters not allowed in a header"))?;
+            v.set_sensitive(true);
+            req = req.header(name, v);
+        }
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let h = resp.headers();
+            let location = h.get(LOCATION).and_then(|v| v.to_str().ok());
+            let content_type = h.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
+            if is_access_rejection(status, location, content_type) {
+                return Err(format!("{ACCESS_DENIED_MESSAGE} (HTTP {status})"));
+            }
+            Ok(status)
+        }
         // reqwest errors carry the URL but never request headers.
         Err(e) => Err(e.without_url().to_string()),
     }
@@ -228,13 +256,55 @@ pub mod fake_http {
         pub method: String,
         pub path: String,
         pub auth: Option<String>,
+        /// `CF-Access-Client-Id` / `CF-Access-Client-Secret`.
+        pub access_id: Option<String>,
+        pub access_secret: Option<String>,
         pub body: String,
+    }
+
+    /// A scripted answer. Status 0 = drop the connection without answering.
+    #[derive(Debug, Clone)]
+    pub struct Reply {
+        pub status: u16,
+        pub content_type: &'static str,
+        pub location: Option<&'static str>,
+    }
+
+    /// Where Access sends a request without a valid service token (login page).
+    pub const ACCESS_LOGIN: &str =
+        "https://ippoan.cloudflareaccess.com/cdn-cgi/access/login/chip-remote.ippoan.org";
+
+    impl Reply {
+        /// The Worker's JSON answer.
+        pub fn json(status: u16) -> Reply {
+            Reply {
+                status,
+                content_type: "application/json",
+                location: None,
+            }
+        }
+        /// Access redirecting to its login page.
+        pub fn access_redirect() -> Reply {
+            Reply {
+                status: 302,
+                content_type: "text/html",
+                location: Some(ACCESS_LOGIN),
+            }
+        }
+        /// Access refusing a bad service token itself (HTML, not the Worker's JSON).
+        pub fn access_forbidden() -> Reply {
+            Reply {
+                status: 403,
+                content_type: "text/html; charset=UTF-8",
+                location: None,
+            }
+        }
     }
 
     #[derive(Clone, Default)]
     pub struct FakeHttp {
         pub requests: Arc<Mutex<Vec<Recorded>>>,
-        script: Arc<Mutex<VecDeque<u16>>>,
+        script: Arc<Mutex<VecDeque<Reply>>>,
         pub url: String,
     }
 
@@ -242,9 +312,14 @@ pub mod fake_http {
         pub fn requests(&self) -> Vec<Recorded> {
             self.requests.lock().unwrap().clone()
         }
-        /// Statuses for the next requests; afterwards 201 for POST, 200 otherwise.
+        /// Statuses (JSON answers) for the next requests; afterwards 201 for POST, 200
+        /// otherwise.
         pub fn script(&self, statuses: &[u16]) {
-            self.script.lock().unwrap().extend(statuses.iter().copied());
+            self.replies(statuses.iter().map(|&s| Reply::json(s)).collect());
+        }
+        /// Like [`FakeHttp::script`] with full answers.
+        pub fn replies(&self, replies: Vec<Reply>) {
+            self.script.lock().unwrap().extend(replies);
         }
     }
 
@@ -283,11 +358,17 @@ pub mod fake_http {
                     let method = first.next().unwrap_or_default().to_string();
                     let path = first.next().unwrap_or_default().to_string();
                     let mut auth = None;
+                    let mut access_id = None;
+                    let mut access_secret = None;
                     let mut len = 0usize;
                     for l in lines {
                         if let Some((k, v)) = l.split_once(':') {
                             match k.trim().to_ascii_lowercase().as_str() {
                                 "authorization" => auth = Some(v.trim().to_string()),
+                                "cf-access-client-id" => access_id = Some(v.trim().to_string()),
+                                "cf-access-client-secret" => {
+                                    access_secret = Some(v.trim().to_string())
+                                }
                                 "content-length" => len = v.trim().parse().unwrap_or(0),
                                 _ => {}
                             }
@@ -303,23 +384,35 @@ pub mod fake_http {
                         buf.extend_from_slice(&chunk[..n]);
                     }
                     let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
-                    let status = srv
-                        .script
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or(if method == "POST" { 201 } else { 200 });
+                    let reply =
+                        srv.script.lock().unwrap().pop_front().unwrap_or_else(|| {
+                            Reply::json(if method == "POST" { 201 } else { 200 })
+                        });
                     srv.requests.lock().unwrap().push(Recorded {
                         method,
                         path,
                         auth,
+                        access_id,
+                        access_secret,
                         body,
                     });
-                    if status == 0 {
+                    if reply.status == 0 {
                         return; // drop: the client sees a network error
                     }
+                    let body = if reply.content_type.contains("json") {
+                        "{}"
+                    } else {
+                        "<html>Forbidden</html>"
+                    };
+                    let location = reply
+                        .location
+                        .map(|l| format!("location: {l}\r\n"))
+                        .unwrap_or_default();
                     let resp = format!(
-                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+                        "HTTP/1.1 {} X\r\ncontent-type: {}\r\n{location}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        reply.status,
+                        reply.content_type,
+                        body.len()
                     );
                     let _ = s.write_all(resp.as_bytes()).await;
                     let _ = s.shutdown().await;
@@ -393,6 +486,9 @@ mod tests {
         assert_eq!(r[0].method, "POST");
         assert_eq!(r[0].path, "/v1/chips");
         assert_eq!(r[0].auth.as_deref(), Some("Bearer secret-token"));
+        // Access not configured: no Access headers at all.
+        assert_eq!(r[0].access_id, None);
+        assert_eq!(r[0].access_secret, None);
         let body: serde_json::Value = serde_json::from_str(&r[0].body).unwrap();
         assert_eq!(
             body,
@@ -498,5 +594,85 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!e.contains("secret-token"), "{e}");
+    }
+
+    fn cfg_with_access(url: &str) -> Config {
+        Config {
+            access_client_id: "0123abcd.access".into(),
+            access_client_secret: "access-secret-value".into(),
+            ..cfg(url)
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_access_headers_on_post_and_delete() {
+        let srv = start().await;
+        let c = cfg_with_access(&srv.url);
+        assert!(deliver(&client(), || Some(c.clone()), &Job::Post(chip()), fast()).await);
+        assert!(
+            deliver(
+                &client(),
+                || Some(c.clone()),
+                &Job::Delete("task_1".into()),
+                fast()
+            )
+            .await
+        );
+        let r = srv.requests();
+        assert_eq!(r.len(), 2);
+        for x in &r {
+            assert_eq!(x.auth.as_deref(), Some("Bearer secret-token"), "{x:?}");
+            assert_eq!(x.access_id.as_deref(), Some("0123abcd.access"), "{x:?}");
+            assert_eq!(x.access_secret.as_deref(), Some("access-secret-value"));
+        }
+        // Only one of the two set: neither is sent.
+        let half = Config {
+            access_client_secret: String::new(),
+            ..c.clone()
+        };
+        assert!(deliver(&client(), || Some(half.clone()), &Job::Post(chip()), fast()).await);
+        let r = srv.requests();
+        assert_eq!(
+            (r[2].access_id.clone(), r[2].access_secret.clone()),
+            (None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn access_rejection_is_logged_and_retried_without_leaking_the_secret() {
+        use crate::logging::capture;
+        use fake_http::Reply;
+        use tracing::instrument::WithSubscriber as _;
+
+        let srv = start().await;
+        // Access login redirect (not followed), Access 403 page, the Worker's own JSON
+        // 401, then accepted.
+        srv.replies(vec![
+            Reply::access_redirect(),
+            Reply::access_forbidden(),
+            Reply::json(401),
+            Reply::json(201),
+        ]);
+        let c = cfg_with_access(&srv.url);
+        let (sub, logs) = capture::subscriber();
+        let ok = deliver(&client(), || Some(c.clone()), &Job::Post(chip()), fast())
+            .with_subscriber(sub)
+            .await;
+        assert!(ok);
+        assert_eq!(srv.requests().len(), 4, "the redirect is not followed");
+        let text = logs.text();
+        assert_eq!(
+            text.matches(ACCESS_DENIED_MESSAGE).count(),
+            2,
+            "302 to Access and Access 403 (not the Worker's 401): {text}"
+        );
+        assert!(
+            text.contains("HTTP 302") && text.contains("HTTP 403"),
+            "{text}"
+        );
+        assert!(text.contains("HTTP 401; retry"), "{text}");
+        for secret in ["access-secret-value", "secret-token", "0123abcd.access"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
     }
 }

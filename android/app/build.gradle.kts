@@ -79,6 +79,14 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     // 自己更新の定期確認 (2.10 以降は compileSdk 35 が要るので 2.9 系)
     implementation("androidx.work:work-runtime-ktx:2.9.1")
+    // 接続コードの QR 読み取り (AlcoholChecker の QrScannerActivity と同じ CameraX + ML Kit)
+    implementation("androidx.camera:camera-core:1.3.1")
+    implementation("androidx.camera:camera-camera2:1.3.1")
+    implementation("androidx.camera:camera-lifecycle:1.3.1")
+    implementation("androidx.camera:camera-view:1.3.1")
+    // Play 開発者サービス経由 (unbundled) の ML Kit。同梱版 (com.google.mlkit:barcode-scanning) は
+    // 4 ABI 分のネイティブライブラリで APK が 5.5MB → 28MB に膨らむ。FCM を使う以上 Play 開発者サービスは前提。
+    implementation("com.google.android.gms:play-services-mlkit-barcode-scanning:18.3.1")
 
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging")

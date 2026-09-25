@@ -3,6 +3,11 @@
 //!
 //! - config is reloaded before every connect; incomplete → [`Status::NoConfig`], retry 30 s
 //! - `Authorization: Bearer <token>` on the upgrade; the token is never logged
+//! - Cloudflare Access: `CF-Access-Client-Id` / `-Secret` on the upgrade when both are
+//!   configured (the log only says `access headers: on/off`). A rejection by Access
+//!   (redirect to `*.cloudflareaccess.com`, or a non-JSON 401 / 403) is logged as
+//!   [`ACCESS_DENIED_MESSAGE`], shown as [`Status::AccessDenied`] and retried with the
+//!   usual backoff (config is re-read, so fixing config.json needs no restart)
 //! - backoff 1 → 2 → … → 60 s, reset after a session that got `hello`;
 //!   close 4000 (another agent took over) → wait `takeoverBackoffSec`
 //! - `hello` resyncs the locate queue (only `located_pending` chips), `chip.new` adds,
@@ -23,6 +28,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use chip_core::access::{is_access_rejection, ACCESS_DENIED_MESSAGE};
 use chip_core::protocol::{Action, ClientMsg, ServerMsg, WireChip, CLOSE_REPLACED};
 use chip_core::sessions::Presence;
 use chip_core::{select_chip, ActionError, ChipInfo, Config};
@@ -32,7 +38,10 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
+use tokio_tungstenite::tungstenite::http::header::{
+    HeaderName, AUTHORIZATION, CONTENT_TYPE, LOCATION,
+};
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -279,19 +288,62 @@ pub struct SessionEnd {
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Opens the WebSocket with the bearer token. Errors never contain the token.
-pub async fn connect(cfg: &Config) -> Result<WsStream, String> {
+/// Why [`connect`] failed. The text never contains the token or the Access secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectError {
+    /// Cloudflare Access answered the upgrade instead of the Worker (HTTP status).
+    AccessDenied(u16),
+    Other(String),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::AccessDenied(status) => {
+                write!(f, "{ACCESS_DENIED_MESSAGE} (HTTP {status})")
+            }
+            ConnectError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Opens the WebSocket with the bearer token (and the Access service token when
+/// configured). Errors never contain the token or the secret.
+pub async fn connect(cfg: &Config) -> Result<WsStream, ConnectError> {
+    let other = ConnectError::Other;
     let mut req = cfg
         .ws_url()
         .into_client_request()
-        .map_err(|e| format!("bad url: {e}"))?;
-    let auth = HeaderValue::from_str(&format!("Bearer {}", cfg.token))
-        .map_err(|_| "token contains characters not allowed in a header".to_string())?;
+        .map_err(|e| other(format!("bad url: {e}")))?;
+    let mut auth = HeaderValue::from_str(&format!("Bearer {}", cfg.token))
+        .map_err(|_| other("token contains characters not allowed in a header".into()))?;
+    auth.set_sensitive(true);
     req.headers_mut().insert(AUTHORIZATION, auth);
+    if let Some(pairs) = cfg.access_headers() {
+        for (name, value) in pairs {
+            let mut v = HeaderValue::from_str(value).map_err(|_| {
+                other(format!(
+                    "{name} contains characters not allowed in a header"
+                ))
+            })?;
+            v.set_sensitive(true);
+            req.headers_mut().insert(HeaderName::from_static(name), v);
+        }
+    }
     match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(req)).await {
-        Err(_) => Err("connect timed out".into()),
-        Ok(Err(WsError::Http(resp))) => Err(format!("upgrade rejected: HTTP {}", resp.status())),
-        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(other("connect timed out".into())),
+        Ok(Err(WsError::Http(resp))) => {
+            let status = resp.status().as_u16();
+            let h = resp.headers();
+            let location = h.get(LOCATION).and_then(|v| v.to_str().ok());
+            let content_type = h.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
+            if is_access_rejection(status, location, content_type) {
+                Err(ConnectError::AccessDenied(status))
+            } else {
+                Err(other(format!("upgrade rejected: HTTP {status}")))
+            }
+        }
+        Ok(Err(e)) => Err(other(e.to_string())),
         Ok(Ok((ws, _))) => Ok(ws),
     }
 }
@@ -579,12 +631,18 @@ pub async fn run_forever(env: AgentEnv) {
         env.driver.configure(cfg.labels.clone(), cfg.prevent_sleep);
         let params = SessionParams::from_config(&cfg);
         let url = cfg.ws_url();
-        tracing::info!("connecting {url}");
+        tracing::info!("connecting {url} (access headers: {})", cfg.access_state());
+        let mut access_denied = false;
         let end = match connect(&cfg).await {
             Ok(mut ws) => {
                 tracing::info!("connected");
                 (env.status)(Status::Connected);
                 run_session(&mut ws, &env.driver, &env.book, &env.withdraw, &params).await
+            }
+            Err(e @ ConnectError::AccessDenied(_)) => {
+                tracing::error!("connect failed: {e}");
+                access_denied = true;
+                SessionEnd::default()
             }
             Err(e) => {
                 tracing::warn!("connect failed: {e}");
@@ -592,12 +650,18 @@ pub async fn run_forever(env: AgentEnv) {
             }
         };
         let (status, wait) = plan_retry(&end, &mut backoff, cfg.takeover_backoff_sec);
+        let status = if access_denied {
+            Status::AccessDenied
+        } else {
+            status
+        };
         (env.status)(status);
         match status {
             Status::Replaced => tracing::warn!(
                 "replaced by another agent ({CLOSE_REPLACED}); retry in {}s",
                 wait.as_secs()
             ),
+            Status::AccessDenied => tracing::info!("retry in {}s", wait.as_secs()),
             _ => tracing::info!(
                 "disconnected (code {}); retry in {}s",
                 end.close_code.map_or("-".to_string(), |c| c.to_string()),
@@ -819,9 +883,16 @@ mod tests {
 
     type ServerWs = WebSocketStream<TcpStream>;
 
+    type Headers = tokio_tungstenite::tungstenite::http::HeaderMap;
+
     struct Server {
         cfg: Config,
-        accepted: tokio::sync::oneshot::Receiver<(ServerWs, Option<String>)>,
+        /// The accepted socket and the upgrade request's headers.
+        accepted: tokio::sync::oneshot::Receiver<(ServerWs, Headers)>,
+    }
+
+    fn hdr(h: &Headers, name: &str) -> Option<String> {
+        h.get(name).map(|v| v.to_str().unwrap().to_string())
     }
 
     // The handshake callback's signature (large ErrorResponse) is fixed by tungstenite.
@@ -832,21 +903,18 @@ mod tests {
         let (tx, accepted) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let auth = Arc::new(Mutex::new(None));
-            let a2 = auth.clone();
+            let headers = Arc::new(Mutex::new(Headers::new()));
+            let h2 = headers.clone();
             let cb = move |req: &Request, resp: Response| {
                 assert_eq!(req.uri().path(), "/v1/agent/ws");
-                *a2.lock().unwrap() = req
-                    .headers()
-                    .get("authorization")
-                    .map(|v| v.to_str().unwrap().to_string());
+                *h2.lock().unwrap() = req.headers().clone();
                 Ok(resp)
             };
             let ws = tokio_tungstenite::accept_hdr_async(stream, cb)
                 .await
                 .unwrap();
-            let a = auth.lock().unwrap().clone();
-            let _ = tx.send((ws, a));
+            let h = headers.lock().unwrap().clone();
+            let _ = tx.send((ws, h));
         });
         let cfg = Config {
             url: format!("http://127.0.0.1:{port}"),
@@ -893,8 +961,14 @@ mod tests {
         let srv = server().await;
         let driver = spawn(fake.clone());
         let mut client = connect(&srv.cfg).await.unwrap();
-        let (ws, auth) = srv.accepted.await.unwrap();
-        assert_eq!(auth.as_deref(), Some("Bearer secret-token"));
+        let (ws, h) = srv.accepted.await.unwrap();
+        assert_eq!(
+            hdr(&h, "authorization").as_deref(),
+            Some("Bearer secret-token")
+        );
+        // Access not configured: neither header is sent.
+        assert_eq!(hdr(&h, "cf-access-client-id"), None);
+        assert_eq!(hdr(&h, "cf-access-client-secret"), None);
         let task =
             tokio::spawn(
                 async move { run_session(&mut client, &driver, &book, &withdraw, &p).await },
@@ -1314,8 +1388,11 @@ mod tests {
             withdraw: Withdrawer::new(PathBuf::from("does-not-exist.json"), fast_retry()),
         };
         let agent = tokio::spawn(run_forever(env));
-        let (mut ws, auth) = srv.accepted.await.unwrap();
-        assert_eq!(auth.as_deref(), Some("Bearer secret-token"));
+        let (mut ws, h) = srv.accepted.await.unwrap();
+        assert_eq!(
+            hdr(&h, "authorization").as_deref(),
+            Some("Bearer secret-token")
+        );
         assert_eq!(st_rx.recv().await, Some(Status::Connected));
         push(&mut ws, json!({"type":"hello","chips":[]})).await;
         ws.close(Some(CloseFrame {
@@ -1374,9 +1451,219 @@ mod tests {
             token: "secret-token".into(),
             ..Config::default()
         };
-        let e = connect(&cfg).await.unwrap_err();
+        let e = connect(&cfg).await.unwrap_err().to_string();
         assert!(e.contains("401"), "{e}");
         assert!(!e.contains("secret-token"));
+    }
+
+    // ---------------- Cloudflare Access
+
+    fn with_access(cfg: &Config) -> Config {
+        Config {
+            access_client_id: "0123abcd.access".into(),
+            access_client_secret: "access-secret-value".into(),
+            ..cfg.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_carries_access_headers_when_configured() {
+        let srv = server().await;
+        let cfg = with_access(&srv.cfg);
+        let _client = connect(&cfg).await.unwrap();
+        let (_ws, h) = srv.accepted.await.unwrap();
+        assert_eq!(
+            hdr(&h, "authorization").as_deref(),
+            Some("Bearer secret-token")
+        );
+        assert_eq!(
+            hdr(&h, "cf-access-client-id").as_deref(),
+            Some("0123abcd.access")
+        );
+        assert_eq!(
+            hdr(&h, "cf-access-client-secret").as_deref(),
+            Some("access-secret-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_without_half_configured_access_headers() {
+        let srv = server().await;
+        let cfg = Config {
+            access_client_id: "0123abcd.access".into(),
+            ..srv.cfg.clone()
+        };
+        let _client = connect(&cfg).await.unwrap();
+        let (_ws, h) = srv.accepted.await.unwrap();
+        assert_eq!(hdr(&h, "cf-access-client-id"), None);
+        assert_eq!(hdr(&h, "cf-access-client-secret"), None);
+    }
+
+    /// A server that answers every connection with `raw` (an HTTP response head).
+    async fn http_answering(raw: &'static str) -> Config {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(raw.as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        Config {
+            url: format!("http://127.0.0.1:{port}"),
+            token: "secret-token".into(),
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn access_rejections_are_recognised() {
+        let redirect = http_answering(
+            "HTTP/1.1 302 Found\r\nlocation: https://ippoan.cloudflareaccess.com/cdn-cgi/access/login/chip-remote.ippoan.org\r\ncontent-length: 0\r\n\r\n",
+        )
+        .await;
+        let e = connect(&with_access(&redirect)).await.unwrap_err();
+        assert_eq!(e, ConnectError::AccessDenied(302));
+        let text = e.to_string();
+        assert!(text.contains(ACCESS_DENIED_MESSAGE), "{text}");
+        assert!(!text.contains("access-secret-value") && !text.contains("secret-token"));
+
+        let forbidden = http_answering(
+            "HTTP/1.1 403 Forbidden\r\ncontent-type: text/html; charset=UTF-8\r\ncontent-length: 9\r\n\r\nForbidden",
+        )
+        .await;
+        assert_eq!(
+            connect(&forbidden).await.unwrap_err(),
+            ConnectError::AccessDenied(403)
+        );
+
+        // The Worker's own 401 (JSON) and a redirect elsewhere are not Access.
+        let worker = http_answering(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 24\r\n\r\n{\"error\":\"unauthorized\"}",
+        )
+        .await;
+        assert_eq!(
+            connect(&worker).await.unwrap_err(),
+            ConnectError::Other("upgrade rejected: HTTP 401".into())
+        );
+        let elsewhere = http_answering(
+            "HTTP/1.1 302 Found\r\nlocation: https://example.com/\r\ncontent-length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(matches!(
+            connect(&elsewhere).await.unwrap_err(),
+            ConnectError::Other(_)
+        ));
+    }
+
+    /// Access rejects the first upgrade; fixing config.json (adding the service token)
+    /// lets the next attempt through without a restart. The secret never reaches the log.
+    // The handshake callback's signature (large ErrorResponse) is fixed by tungstenite.
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn run_forever_retries_after_access_rejection_and_rereads_config() {
+        use crate::logging::capture;
+        use tracing::instrument::WithSubscriber as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (rejected_tx, rejected_rx) = tokio::sync::oneshot::channel();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // 1st: Access (no service token yet) → its HTML 403.
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let _ = s
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\ncontent-type: text/html\r\ncontent-length: 0\r\n\r\n",
+                )
+                .await;
+            let _ = s.shutdown().await;
+            let _ = rejected_tx.send(());
+            // 2nd: let it through and report the headers.
+            let (stream, _) = listener.accept().await.unwrap();
+            let headers = Arc::new(Mutex::new(Headers::new()));
+            let h2 = headers.clone();
+            let cb = move |req: &Request, resp: Response| {
+                *h2.lock().unwrap() = req.headers().clone();
+                Ok(resp)
+            };
+            let ws = tokio_tungstenite::accept_hdr_async(stream, cb)
+                .await
+                .unwrap();
+            let h = headers.lock().unwrap().clone();
+            let _ = accepted_tx.send((ws, h));
+        });
+
+        let tmp = TempDir::new("access");
+        let path = tmp.0.join("config.json");
+        let url = format!("http://127.0.0.1:{port}");
+        std::fs::write(
+            &path,
+            json!({"url": url, "token": "secret-token"}).to_string(),
+        )
+        .unwrap();
+        let (st_tx, mut st_rx) = tokio::sync::mpsc::unbounded_channel();
+        let env = AgentEnv {
+            config_path: path.clone(),
+            driver: spawn(Fake::default()),
+            status: Arc::new(move |s| {
+                let _ = st_tx.send(s);
+            }),
+            book: ChipBook::default(),
+            withdraw: Withdrawer::new(PathBuf::from("does-not-exist.json"), fast_retry()),
+        };
+        let (sub, logs) = capture::subscriber();
+        let agent = tokio::spawn(run_forever(env).with_subscriber(sub));
+
+        tokio::time::timeout(Duration::from_secs(5), rejected_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // Fixed while the agent waits for its 1 s backoff.
+        std::fs::write(
+            &path,
+            json!({"url": url, "token": "secret-token",
+                   "accessClientId": "0123abcd.access",
+                   "accessClientSecret": " access-secret-value\r\n"})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(st_rx.recv().await, Some(Status::AccessDenied));
+        let (_ws, h) = tokio::time::timeout(Duration::from_secs(10), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(st_rx.recv().await, Some(Status::Connected));
+        assert_eq!(
+            hdr(&h, "authorization").as_deref(),
+            Some("Bearer secret-token")
+        );
+        assert_eq!(
+            hdr(&h, "cf-access-client-id").as_deref(),
+            Some("0123abcd.access")
+        );
+        assert_eq!(
+            hdr(&h, "cf-access-client-secret").as_deref(),
+            Some("access-secret-value")
+        );
+        agent.abort();
+
+        let text = logs.text();
+        assert!(text.contains("access headers: off"), "{text}");
+        assert!(text.contains("access headers: on"), "{text}");
+        assert!(
+            text.contains(&format!("{ACCESS_DENIED_MESSAGE} (HTTP 403)")),
+            "{text}"
+        );
+        for secret in ["access-secret-value", "secret-token", "0123abcd.access"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
     }
 
     // ---------------- reconcile with the session files (Worker HTTP faked too)

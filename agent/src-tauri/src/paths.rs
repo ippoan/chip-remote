@@ -27,7 +27,8 @@ pub fn local_dir() -> PathBuf {
 }
 
 /// Written by 「設定ファイルを開く」 when config.json does not exist yet. Same keys and
-/// defaults as chip_core::Config, token left empty for the user.
+/// defaults as chip_core::Config, token left empty for the user. `accessClientId` /
+/// `accessClientSecret` (Cloudflare Access service token) are empty = not sent.
 pub const CONFIG_TEMPLATE: &str = r#"{
   "url": "https://chip-remote.ippoan.org",
   "token": "",
@@ -42,7 +43,9 @@ pub const CONFIG_TEMPLATE: &str = r#"{
   "takeoverBackoffSec": 300,
   "raiseWaitSec": 5,
   "preventSleep": true,
-  "watchSessions": true
+  "watchSessions": true,
+  "accessClientId": "",
+  "accessClientSecret": ""
 }
 "#;
 
@@ -96,6 +99,11 @@ mod tests {
         assert_eq!(c.raise_wait_sec, d.raise_wait_sec);
         assert_eq!(c.prevent_sleep, d.prevent_sleep);
         assert_eq!(c.watch_sessions, d.watch_sessions);
+        assert_eq!(c.access_client_id, "");
+        assert_eq!(c.access_client_secret, "");
+        let v: serde_json::Value = serde_json::from_str(CONFIG_TEMPLATE).unwrap();
+        assert_eq!(v["accessClientId"], "");
+        assert_eq!(v["accessClientSecret"], "");
 
         let dir = tmp("tpl");
         let p = dir.join("chip-remote").join("config.json");

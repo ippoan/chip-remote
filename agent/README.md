@@ -22,7 +22,7 @@ Claude desktop が動く Windows のログオンセッションに常駐し、Wo
 - 切断時は 1 秒から倍々で最大 60 秒待って再接続 (`hello` を受けたセッションの後は 1 秒に戻す)。
   close 4000 (別の agent が接続を奪った) を受けたら `takeoverBackoffSec` 待つ
 
-ウィンドウは持たない (タスクトレイのアイコンだけ)。
+ウィンドウは持たない (タスクトレイのアイコンだけ。「スマホ接続用 QR を表示」のときだけ小さなウィンドウを出す)。
 
 ## インストール
 
@@ -35,7 +35,8 @@ Claude desktop が動く Windows のログオンセッションに常駐し、Wo
    (以後トレイのチェックで切り替え、外した設定は保たれる)。
 4. `config.json` が無い / `token` が空なら状態が「設定がありません」になる。
    トレイの「設定ファイルを開く」で雛形 (token 空) が作られて既定のアプリで開くので、
-   `token` を埋めて保存する。30 秒以内に読み直して接続する (再起動不要)。
+   `token` を埋めて保存する (Cloudflare Access を使うなら `accessClientId` / `accessClientSecret` も)。
+   30 秒以内に読み直して接続する (再起動不要)。
 
 アンインストールは Windows の「インストールされているアプリ」から。設定とログは残る。
 
@@ -59,6 +60,22 @@ WS 側は接続を張り直すたびに読み直す (値を変えたら次の再
 | `watchSessions` | true | Claude desktop のセッションファイルを監視して chip を Worker に報告する。false なら報告しない (hook を使う) |
 | `sessionsDir` | (空 = `%APPDATA%\Claude\claude-code-sessions`) | セッションファイルの場所 |
 | `host` | (空 = PC 名) | セッションファイルから報告する chip の `host` (Windows hook と共通のキー) |
+| `accessClientId` | (空) | Cloudflare Access の service token の Client ID。`CF-Access-Client-Id` ヘッダで送る |
+| `accessClientSecret` | (空) | 同 Client Secret。`CF-Access-Client-Secret` ヘッダで送る。ログには出さない |
+
+### Cloudflare Access
+
+Worker の前段に Cloudflare Access (service token) を置く構成に対応している
+(契約は [`docs/PROTOCOL.md`](../docs/PROTOCOL.md)「認証」)。
+
+- `accessClientId` と `accessClientSecret` が **両方** 入っているときだけ、WS の upgrade
+  (`/v1/agent/ws`) と全 HTTP (`POST` / `DELETE /v1/chips`) に 2 ヘッダを付ける。Bearer (`token`) も従来どおり送る。
+  値の前後の空白・改行は無視する。片方だけなら送らない (ログに「片方しか設定されていません」)
+- 未設定でも従来どおり動く (Access を有効にする前に入れておける)
+- Access に拒否される (`*.cloudflareaccess.com` へのリダイレクト、または JSON でない 401 / 403) と、ログに
+  「Cloudflare Access に拒否されました (accessClientId / accessClientSecret を確認)」を出し、トレイの状態も同じ表示になる。
+  通常の backoff (1 → 60 秒) で再試行し、毎回 config.json を読み直すので、直して保存すれば再起動は要らない
+- ログには `connecting … (access headers: on/off)` だけを書き、id / secret は書かない
 
 ## セッションファイルの監視
 
@@ -81,9 +98,10 @@ SSH 先 (mini-ryzen) のセッションのファイルもこの PC にあるの�
 
 | 項目 | 動作 |
 |---|---|
-| 状態: … | 「接続中」「切断中 (再接続待ち)」「設定がありません」「別の agent に交代しました」(押せない) |
+| 状態: … | 「接続中」「切断中 (再接続待ち)」「設定がありません」「別の agent に交代しました」「Cloudflare Access に拒否されました」(押せない) |
 | バージョン … | インストールされている版 (CI build は `0.0.<run番号>`) |
 | 設定ファイルを開く | `config.json` を既定のアプリで開く (無ければ雛形を作る。開けなければメモ帳) |
+| スマホ接続用 QR を表示 | `url` / `token` / `accessClientId` / `accessClientSecret` を入れた接続コード (`chipremote:…`、形式は PROTOCOL.md「接続コード」) の QR を小さなウィンドウに出す。Android アプリで読むと接続設定が入る。**token を含むので読んだら閉じる**。`url` / `token` が未設定なら「設定がありません」。開くたびに config.json を読み直す。QR はローカルで生成し、ネットワークには出ない |
 | ログをコピー | 直近 2000 行のログをクリップボードへ |
 | ログフォルダを開く | `%LOCALAPPDATA%\chip-remote` をエクスプローラーで開く |
 | ログオン時に起動 | 自動起動 (HKCU の Run) の切り替え |
@@ -94,7 +112,8 @@ SSH 先 (mini-ryzen) のセッションのファイルもこの PC にあるの�
 ## ログ
 
 `%LOCALAPPDATA%\chip-remote\agent.log` (UTF-8)。1 MB を超えると `agent.log.1` に回す (1 世代)。
-WS の送受信は 1 行ずつ残す (長い文字列フィールドは 80 文字、1 行は 1000 文字で切る)。token は出さない。
+WS の送受信は 1 行ずつ残す (長い文字列フィールドは 80 文字、1 行は 1000 文字で切る)。
+token・`accessClientSecret`・接続コード (QR の中身) は出さない。
 詳しく見たいときは環境変数 `CHIP_REMOTE_LOG=debug` (tracing の EnvFilter 書式) で起動する。
 
 ## 自動更新

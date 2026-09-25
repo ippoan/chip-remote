@@ -12,6 +12,9 @@ pub enum Status {
     NoConfig,
     /// The Worker closed us with 4000: another agent connected. Waits takeoverBackoffSec.
     Replaced,
+    /// Cloudflare Access rejected the upgrade (service token missing / wrong). Retried
+    /// with the usual backoff; config.json is re-read each time.
+    AccessDenied,
 }
 
 impl Status {
@@ -21,6 +24,7 @@ impl Status {
             Status::Disconnected => "切断中 (再接続待ち)",
             Status::NoConfig => "設定がありません",
             Status::Replaced => "別の agent に交代しました",
+            Status::AccessDenied => "Cloudflare Access に拒否されました",
         }
     }
 }
@@ -38,5 +42,9 @@ mod tests {
         assert_eq!(Status::Disconnected.label(), "切断中 (再接続待ち)");
         assert_eq!(Status::NoConfig.label(), "設定がありません");
         assert_eq!(Status::Replaced.label(), "別の agent に交代しました");
+        assert_eq!(
+            Status::AccessDenied.label(),
+            "Cloudflare Access に拒否されました"
+        );
     }
 }
