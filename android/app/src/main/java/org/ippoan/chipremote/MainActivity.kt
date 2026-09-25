@@ -35,6 +35,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var emptyText: TextView
     private lateinit var chipList: LinearLayout
     private lateinit var swipe: SwipeRefreshLayout
+    private lateinit var settingsGroup: View
+    private lateinit var settingsToggle: Button
     private lateinit var updateButton: Button
     private lateinit var updateStatus: TextView
 
@@ -63,6 +65,12 @@ class MainActivity : AppCompatActivity() {
 
         urlInput.setText(Settings.url(this))
         tokenInput.setText(Settings.token(this))
+
+        settingsGroup = findViewById(R.id.settings_group)
+        settingsToggle = findViewById(R.id.settings_toggle)
+        settingsToggle.setOnClickListener { setSettingsOpen(settingsGroup.visibility != View.VISIBLE) }
+        // token が保存済みなら接続設定は閉じておく (普段は一覧だけ見えればよい)
+        setSettingsOpen(Settings.token(this).isBlank())
 
         findViewById<TextView>(R.id.firebase_text).text =
             if (ChipRemoteApp.firebaseReady) "Firebase: 設定済み (${BuildConfig.FIREBASE_PROJECT_ID})"
@@ -226,6 +234,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 client.registerDevice(fcmToken(), Build.MODEL)
                 setStatus("登録しました (${Build.MODEL})")
+                setSettingsOpen(false)
             } catch (e: Exception) {
                 setStatus("登録失敗: ${e.message ?: e.javaClass.simpleName}")
             }
@@ -299,6 +308,11 @@ class MainActivity : AppCompatActivity() {
             }
             refresh()
         }
+    }
+
+    private fun setSettingsOpen(open: Boolean) {
+        settingsGroup.visibility = if (open) View.VISIBLE else View.GONE
+        settingsToggle.text = if (open) "接続設定を閉じる" else "接続設定を表示"
     }
 
     private fun setStatus(text: String) {

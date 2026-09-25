@@ -49,11 +49,25 @@
                 android:textAppearance="?attr/textAppearanceBodySmall"
                 android:visibility="gone" />
 
+            <Button
+                android:id="@+id/settings_toggle"
+                style="?attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="接続設定を表示" />
+
+            <!-- token が保存済みなら閉じておく (MainActivity.applySettingsVisibility) -->
+            <LinearLayout
+                android:id="@+id/settings_group"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
             <EditText
                 android:id="@+id/url_input"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
                 android:autofillHints=""
                 android:hint="Worker URL"
                 android:inputType="textUri" />
@@ -72,6 +86,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:text="端末を登録" />
+            </LinearLayout>
 
             <TextView
                 android:id="@+id/status_text"
