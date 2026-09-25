@@ -14,7 +14,8 @@ Debug modes (no network):
 Config: %APPDATA%\chip-remote\config.json (UTF-8)
   { "url": "https://chip-remote.ippoan.org", "token": "...",
     "labels": { "marker": "...", "start": "...", "dismiss": "..." },
-    "locateTimeoutSec": 60, "scanIntervalSec": 2, "takeoverBackoffSec": 300 }
+    "locateTimeoutSec": 60, "scanIntervalSec": 2, "takeoverBackoffSec": 300,
+    "raiseWaitSec": 5, "preventSleep": true }
 Log:    %LOCALAPPDATA%\chip-remote\agent.log (rotated at 1 MB)
 
 This file must stay pure ASCII (Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI).
@@ -100,7 +101,9 @@ function Invoke-ProbeMode {
         return 1
     }
     Write-Host ('window: "{0}" hwnd={1}' -f $window.Current.Name, $window.Current.NativeWindowHandle)
-    $chips = @(Get-ChipList -Window $window -Labels $Labels)
+    $chips = @(Invoke-WithClaudeRaised -Window $window -ScriptBlock {
+            Wait-ChipList -Window $window -Labels $Labels -TimeoutSec $script:RaiseWaitSec
+        })
     Write-Host ('chips: {0}' -f $chips.Count)
     $i = 0
     foreach ($c in $chips) {
@@ -139,11 +142,20 @@ function Invoke-ChipRequest {
         if (-not $window) {
             return @{ ok = $false; error = 'claude_not_running'; detail = 'no Claude main window' }
         }
-        $chip = Find-Chip -Window $window -Labels $Labels -Title $ChipTitle -Tldr $ChipTldr
-        if (-not $chip) {
-            return @{ ok = $false; error = 'chip_not_found'; detail = 'no chip with that title in the UIA tree' }
-        }
-        return (Invoke-ChipAction -Chip $chip -Action $Action -Labels $Labels)
+        # The window is usually covered while the user is away, so Chromium has not
+        # rendered the chip; un-occlude it for the duration of find + invoke.
+        return (Invoke-WithClaudeRaised -Window $window -ScriptBlock {
+            # Wait until Chromium renders again (any chip), then briefly for the title itself
+            # (other panes' chips may be stale for a moment); if it is behind the pager,
+            # Find-ChipPaged pages to it.
+            [void](Wait-ChipList -Window $window -Labels $Labels -TimeoutSec $script:RaiseWaitSec)
+            [void](Wait-ChipList -Window $window -Labels $Labels -Title $ChipTitle -Tldr $ChipTldr -TimeoutSec 1.5)
+            $hit = Find-ChipPaged -Window $window -Labels $Labels -Title $ChipTitle -Tldr $ChipTldr
+            if (-not $hit) {
+                return @{ ok = $false; error = 'chip_not_found'; detail = 'no chip with that title in the UIA tree' }
+            }
+            return (Invoke-ChipAction -Chip $hit.Element -Action $Action -Labels $Labels)
+        })
     } catch {
         return @{ ok = $false; error = 'invoke_failed'; detail = $_.Exception.Message }
     }
@@ -180,8 +192,11 @@ function Close-WsQuietly {
 
 # ---------------------------------------------------------------- locate queue
 
-# task_id -> @{ task_id; title; tldr; deadline }
+# task_id -> @{ task_id; title; tldr; deadline; raised }
 $script:LocateQueue = @{}
+
+# Seconds to wait for Chromium to rebuild its a11y tree after un-occluding the window.
+$script:RaiseWaitSec = 5
 
 function Add-LocateItem {
     param($Chip, [int]$TimeoutSec)
@@ -199,6 +214,8 @@ function Add-LocateItem {
         title    = [string]$Chip.title
         tldr     = $tl
         deadline = (Get-Date).AddSeconds($TimeoutSec)
+        raised   = $false
+        found    = $false
     }
     Write-AgentLog ('queued ' + $id)
 }
@@ -209,7 +226,26 @@ function Invoke-LocateScan {
     $chips = @()
     try {
         $window = Get-ClaudeWindow
-        if ($window) { $chips = @(Get-ChipList -Window $window -Labels $Labels) }
+        if ($window) {
+            $chips = @(Get-ChipList -Window $window -Labels $Labels)
+            # Not visible without disturbing the screen: raise the window once per chip.
+            $unraised = @($script:LocateQueue.Values | Where-Object {
+                    -not $_.raised -and -not (Select-Chip -Chips $chips -Title $_.title -Tldr $_.tldr) })
+            if ($unraised.Count -gt 0) {
+                Invoke-WithClaudeRaised -Window $window -ScriptBlock {
+                    [void](Wait-ChipList -Window $window -Labels $Labels -TimeoutSec $script:RaiseWaitSec)
+                    [void](Wait-ChipList -Window $window -Labels $Labels -Title $unraised[0].title `
+                        -Tldr $unraised[0].tldr -TimeoutSec 1.5)
+                    foreach ($u in $unraised) {
+                        # Chips behind the pager of a multi-chip session need paging to be seen.
+                        if (Find-ChipPaged -Window $window -Labels $Labels -Title $u.title -Tldr $u.tldr) {
+                            $u.found = $true
+                        }
+                    }
+                }
+                foreach ($u in $unraised) { $u.raised = $true }
+            }
+        }
     } catch {
         Write-AgentLog ('scan failed: ' + $_.Exception.Message) 'WARN'
     }
@@ -218,7 +254,7 @@ function Invoke-LocateScan {
         $item = $script:LocateQueue[$id]
         $hit = $null
         if ($chips.Count -gt 0) { $hit = Select-Chip -Chips $chips -Title $item.title -Tldr $item.tldr }
-        if ($hit) {
+        if ($hit -or $item.found) {
             Send-WsJson $Socket ([ordered]@{ type = 'chip.located'; task_id = $id })
             $script:LocateQueue.Remove($id)
         } elseif ($now -ge $item.deadline) {
@@ -358,6 +394,11 @@ function Invoke-ResidentMode {
     $scanInterval = [int](Get-ConfigValue $Config 'scanIntervalSec' 2)
     $takeoverBackoff = [int](Get-ConfigValue $Config 'takeoverBackoffSec' 300)
     if ($scanInterval -lt 1) { $scanInterval = 1 }
+    $script:RaiseWaitSec = [double](Get-ConfigValue $Config 'raiseWaitSec' 5)
+    if ([bool](Get-ConfigValue $Config 'preventSleep' $true)) {
+        if (Enable-KeepAwake) { Write-AgentLog 'keep-awake on (system sleep blocked while the agent runs)' }
+        else { Write-AgentLog 'keep-awake request failed' 'WARN' }
+    }
 
     # One agent per desktop session; a second one would keep kicking the first off (close 4000).
     $created = $false

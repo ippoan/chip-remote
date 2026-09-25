@@ -4,9 +4,12 @@
   "labels": {
     "marker": "推奨タスク",
     "start": "ワークツリーで開始",
-    "dismiss": "提案を非表示"
+    "dismiss": "提案を非表示",
+    "next": "次の提案を表示"
   },
   "locateTimeoutSec": 60,
   "scanIntervalSec": 2,
-  "takeoverBackoffSec": 300
+  "takeoverBackoffSec": 300,
+  "raiseWaitSec": 5,
+  "preventSleep": true
 }
