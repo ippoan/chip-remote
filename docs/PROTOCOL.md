@@ -1,6 +1,6 @@
 # chip-remote プロトコル
 
-`hooks/`・Worker (リポジトリ直下)・`windows-agent/`・`android/` の 4 者の契約。
+`hooks/` (任意)・Worker (リポジトリ直下)・`agent/` (Windows)・`android/` の 4 者の契約。
 どれかを変えるときはこのファイルを同じ PR で更新する。
 
 ## 登場人物

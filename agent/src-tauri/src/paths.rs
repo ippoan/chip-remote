@@ -27,7 +27,7 @@ pub fn local_dir() -> PathBuf {
 }
 
 /// Written by 「設定ファイルを開く」 when config.json does not exist yet. Same keys and
-/// defaults as windows-agent/config.example.json, token left empty for the user.
+/// defaults as chip_core::Config, token left empty for the user.
 pub const CONFIG_TEMPLATE: &str = r#"{
   "url": "https://chip-remote.ippoan.org",
   "token": "",

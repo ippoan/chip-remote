@@ -1,6 +1,6 @@
 //! Windows backend: IUIAutomation (COM) + a few user32 calls for the un-occlude dance.
 //!
-//! Port of windows-agent/ChipUia.psm1. The measured facts this relies on are in
+//! Port of the retired PowerShell ChipUia.psm1. The measured facts this relies on are in
 //! docs/PROTOCOL.md "UIA での chip の見え方" and in the comments below.
 
 use std::cell::RefCell;

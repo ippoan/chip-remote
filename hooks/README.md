@@ -108,8 +108,8 @@ printf '%s' '{"tool_input":{"task_id":"task_deadbeef"}}' | ~/.claude/hooks/chip-
 ## Windows へのインストール (ローカルセッション用)
 
 設定は agent と共有の `%APPDATA%\chip-remote\config.json` (`url`, `token`、任意で `host`)。
-`windows-agent\install.ps1` を実行済みならもう存在する。無ければ `windows-agent\config.example.json` を
-そこへコピーして `url` / `token` を埋める (UTF-8 のまま)。
+agent (`agent/`) を入れていれば既にある (トレイの「設定ファイルを開く」で雛形が作られる)。
+`url` / `token` を埋める (UTF-8 のまま)。
 
 `%USERPROFILE%\.claude\settings.json` の `hooks.PostToolUse` に追加
 (パスはリポジトリの置き場所に合わせる。Claude Code は hook を Git Bash 経由で実行するので `/` 区切りで書く):
