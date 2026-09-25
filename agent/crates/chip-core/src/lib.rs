@@ -1,18 +1,23 @@
 //! Platform-independent core of the chip-remote Windows agent.
 //!
 //! - [`config`] — `%APPDATA%\chip-remote\config.json` (same file the PowerShell agent used)
+//! - [`access`] — recognising a Cloudflare Access rejection (vs the Worker's own errors)
+//! - [`pairing`] — the `chipremote:` connection code shown as a QR for the phone
 //! - [`protocol`] — WebSocket messages exchanged with the Worker (docs/PROTOCOL.md)
 //! - [`matching`] — picking the chip that corresponds to a task (title, then tldr)
 //! - [`sessions`] — Claude desktop's session files (pending chips) and their diff
 //! - [`ActionError`] — error codes reported in `action.result`
 
+pub mod access;
 pub mod config;
 pub mod matching;
+pub mod pairing;
 pub mod protocol;
 pub mod sessions;
 
 pub use config::{Config, Labels};
 pub use matching::{normalize, select_chip, ChipInfo};
+pub use pairing::connect_code;
 
 /// Why an action (or a locate) could not be completed. `code()` is the wire value
 /// for `action.result.error` (docs/PROTOCOL.md).

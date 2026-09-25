@@ -182,6 +182,45 @@ pub fn log_view(text: &str) -> String {
 }
 
 #[cfg(test)]
+pub mod capture {
+    //! Collects everything (debug and up) logged while a future runs, for tests that
+    //! check what reaches agent.log. Use with `tracing::instrument::WithSubscriber`:
+    //! `fut.with_subscriber(sub)` (tasks spawned inside are not covered).
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    pub struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Captured {
+        pub fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub fn subscriber() -> (impl tracing::Subscriber + Send + Sync, Captured) {
+        let out = Captured::default();
+        let w = out.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || w.clone())
+            .finish();
+        (sub, out)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

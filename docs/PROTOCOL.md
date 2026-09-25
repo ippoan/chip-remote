@@ -21,6 +21,36 @@ WebSocket も同じヘッダで upgrade する (PowerShell の `ClientWebSocket.
 比較は定数時間 (前後の空白・改行は trim)。token は GCP `cloudsql-sv` の `CHIP_REMOTE_TOKEN` が SoT で、
 Worker には CF Secrets Store binding で渡す (secrets-inventory MCP の `sync_from_gcp` で写す)。
 
+### Cloudflare Access (Worker の前段)
+
+`chip-remote.ippoan.org` の前に Cloudflare Access (service token、policy は `non_identity`) を置く。
+**Bearer はそのまま必須** で、Access はその手前の 2 枚目の鍵。
+
+- `/health` は Access を bypass (従来どおり認証なし)
+- それ以外の全パス (HTTP API と `/v1/agent/ws` の WebSocket upgrade) は、Bearer に加えて
+  `CF-Access-Client-Id: <id>` と `CF-Access-Client-Secret: <secret>` の 2 ヘッダが必須
+- クライアント (agent / phone / hook) は id と secret が **両方** 設定されているときだけ 2 ヘッダを送る
+  (片方だけなら送らない)。Access を有効にするのはクライアントの対応後なので、未設定でも従来どおり動く
+- Access に拒否されたときの応答は Worker のものと区別できる: `*.cloudflareaccess.com` への 3xx リダイレクト
+  (ログイン画面) か、JSON でない 401 / 403 (HTML)。Worker 自身はリダイレクトせず、401 は
+  `{"error":"unauthorized"}` (JSON)。クライアントはリダイレクトを追わない
+- agent は Access の拒否を「Cloudflare Access に拒否されました (accessClientId / accessClientSecret を確認)」と
+  ログに出し、通常の backoff で再試行する (config.json は毎回読み直すので直せば再起動不要)。
+  secret (と id + secret の組) はログに出さない
+
+### 接続コード (agent → phone の QR)
+
+agent のトレイ「スマホ接続用 QR を表示」は、phone に接続設定を渡す QR を出す。中身は
+
+```
+chipremote:<base64url(UTF-8 JSON)>          (base64url は RFC 4648 §5、padding なし)
+JSON: {"url":"https://chip-remote.ippoan.org","token":"...","accessClientId":"...","accessClientSecret":"..."}
+```
+
+- `url` は末尾 `/` なし、値は trim 済み。`accessClientId` / `accessClientSecret` は両方設定されているときだけ入れる
+  (無ければキーごと省略)
+- `url` / `token` が未設定なら QR は出さない。token と secret を含むので agent はログに出さない
+
 ## chip の状態
 
 ```

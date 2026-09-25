@@ -47,6 +47,21 @@ class MainActivity : AppCompatActivity() {
     /** 「不明なアプリのインストール」の設定画面から戻ったら更新を続ける。 */
     private var resumeUpdateAfterSettings = false
 
+    private lateinit var connectCodeInput: EditText
+    private lateinit var accessStatus: TextView
+    private lateinit var clearAccessButton: Button
+
+    /** QrScannerActivity は接続コードとして読めたものだけを返す。 */
+    private val qrScanner =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            val data = result.data
+            val value = data?.getStringExtra(QrScannerActivity.EXTRA_RESULT)
+            when {
+                result.resultCode == RESULT_OK && value != null -> applyConnectCode(value)
+                else -> data?.getStringExtra(QrScannerActivity.EXTRA_ERROR)?.let { setStatus(it) }
+            }
+        }
+
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (!granted) setStatus("通知が許可されていません (設定から許可してください)")
@@ -75,6 +90,22 @@ class MainActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.firebase_text).text =
             if (ChipRemoteApp.firebaseReady) "Firebase: 設定済み (${BuildConfig.FIREBASE_PROJECT_ID})"
             else "Firebase 未設定 (通知は届きません。一覧からの操作のみ可能)"
+
+        connectCodeInput = findViewById(R.id.connect_code_input)
+        accessStatus = findViewById(R.id.access_status)
+        clearAccessButton = findViewById(R.id.clear_access_button)
+        renderAccess()
+        findViewById<Button>(R.id.scan_qr_button).setOnClickListener {
+            qrScanner.launch(Intent(this, QrScannerActivity::class.java))
+        }
+        findViewById<Button>(R.id.connect_code_button).setOnClickListener {
+            applyConnectCode(connectCodeInput.text.toString())
+        }
+        clearAccessButton.setOnClickListener {
+            Settings.saveAccess(this, null)
+            renderAccess()
+            setStatus("Cloudflare Access の設定を消しました")
+        }
 
         findViewById<Button>(R.id.register_button).setOnClickListener { register() }
         findViewById<Button>(R.id.refresh_button).setOnClickListener { refresh() }
@@ -221,6 +252,30 @@ class MainActivity : AppCompatActivity() {
         return Settings.client(this).also {
             if (it == null) setStatus("Worker URL と token を入力してください")
         }
+    }
+
+    /** 接続コード (QR / 貼り付け) を保存して、そのまま端末登録まで進める。 */
+    private fun applyConnectCode(text: String) {
+        val code = parseConnectCode(text)
+        if (code == null) {
+            setStatus("接続コードではありません")
+            return
+        }
+        Settings.save(this, code)
+        urlInput.setText(code.url)
+        tokenInput.setText(code.token)
+        // secret を画面に残さない
+        connectCodeInput.text.clear()
+        renderAccess()
+        setSettingsOpen(false)
+        register()
+        refresh()
+    }
+
+    private fun renderAccess() {
+        val set = Settings.access(this) != null
+        accessStatus.text = if (set) "Cloudflare Access: 設定済み" else "Cloudflare Access: 未設定"
+        clearAccessButton.visibility = if (set) View.VISIBLE else View.GONE
     }
 
     private fun register() {

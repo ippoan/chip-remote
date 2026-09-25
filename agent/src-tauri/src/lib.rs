@@ -1,4 +1,4 @@
-//! chip-remote Windows agent as a Tauri 2 tray app (no window).
+//! chip-remote Windows agent as a Tauri 2 tray app (no window except the connection QR).
 //!
 //! - [`agent`] — Worker WebSocket, locate queue, actions (testable, no Tauri)
 //! - [`watcher`] / [`reporter`] / [`book`] — Claude desktop's session files → chips
@@ -8,6 +8,7 @@
 //! - [`uia`] — the real driver (`chip_uia::Uia`)
 //! - [`logging`] — agent.log (1 MB rotation) + ring buffer for 「ログをコピー」
 //! - [`paths`] / [`status`] — locations, config template, tray status labels
+//! - [`qr`] — 「スマホ接続用 QR を表示」 window (connection code for the phone)
 //! - this file — tray menu, plugins (single instance, autostart, opener, updater)
 
 pub mod agent;
@@ -15,6 +16,7 @@ pub mod book;
 pub mod driver;
 pub mod logging;
 pub mod paths;
+pub mod qr;
 pub mod reconcile;
 pub mod reporter;
 pub mod status;
@@ -129,6 +131,7 @@ fn build_tray(
         None::<&str>,
     )?;
     let open_cfg = MenuItem::with_id(app, "open_config", "設定ファイルを開く", true, None::<&str>)?;
+    let show_qr = MenuItem::with_id(app, "show_qr", "スマホ接続用 QR を表示", true, None::<&str>)?;
     let copy = MenuItem::with_id(app, "copy_logs", "ログをコピー", true, None::<&str>)?;
     let open_logs = MenuItem::with_id(app, "open_logs", "ログフォルダを開く", true, None::<&str>)?;
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
@@ -148,6 +151,7 @@ fn build_tray(
             &version,
             &PredefinedMenuItem::separator(app)?,
             &open_cfg,
+            &show_qr,
             &copy,
             &open_logs,
             &PredefinedMenuItem::separator(app)?,
@@ -164,6 +168,7 @@ fn build_tray(
         .show_menu_on_left_click(true)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open_config" => open_config(app, &config_path),
+            "show_qr" => qr::show_window(app),
             "copy_logs" => copy_logs(&ring),
             "open_logs" => open_log_dir(app, &local_dir),
             "autostart" => toggle_autostart(app, &autostart_item),
@@ -246,6 +251,11 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_opener::init());
+    // The QR page, generated from config.json on every load (see qr.rs).
+    let qr_config = config_path.clone();
+    builder = builder.register_uri_scheme_protocol(qr::SCHEME, move |ctx, _req| {
+        qr::respond(ctx.webview_label(), &qr_config)
+    });
     if has_updater {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }
@@ -284,7 +294,8 @@ pub fn run() {
         .expect("error while building the tauri application");
 
     app.run(|_app, event| {
-        // No windows: keep running until 「終了」 (app.exit gives an explicit code).
+        // No windows (the QR window may be closed): keep running until 「終了」
+        // (app.exit gives an explicit code).
         if let RunEvent::ExitRequested {
             code: None, api, ..
         } = event
