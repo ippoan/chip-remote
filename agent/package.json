@@ -1,0 +1,7 @@
+{
+  "name": "chip-remote-agent",
+  "private": true,
+  "version": "0.1.0",
+  "devDependencies": { "@tauri-apps/cli": "^2" },
+  "scripts": { "tauri": "tauri", "build": "tauri build" }
+}

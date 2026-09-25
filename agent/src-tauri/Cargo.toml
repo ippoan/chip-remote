@@ -1,0 +1,42 @@
+[package]
+name = "chip-remote-agent"
+version = "0.1.0"
+description = "chip-remote Windows agent (Tauri tray app): presses spawn_task chips in Claude desktop on request from the phone"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "chip_remote_agent_lib"
+# Windows desktop only: no mobile staticlib / cdylib.
+crate-type = ["rlib"]
+
+[[bin]]
+name = "chip-remote-agent"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+chip-core = { path = "../crates/chip-core" }
+# UIA (Windows; a stub that reports claude_not_running elsewhere).
+chip-uia = { path = "../crates/chip-uia" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-opener = "2"
+# 起動時 + 1 時間ごとに GitHub Release (agent-latest) の latest.json を見て自己更新する。
+# 署名鍵が無い CI build では tauri.conf.json から updater を外して build する (agent.yml)。
+tauri-plugin-updater = "2"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+# TLS は native-tls (Windows では SChannel)。rustls の aws-lc-rs のような C ビルドが要らない。
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "local-time"] }
+# 「ログをコピー」。AlcAppTauri と同じく tauri-plugin-clipboard より依存が薄い arboard。
+arboard = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "test-util"] }

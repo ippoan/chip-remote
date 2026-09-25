@@ -12,3 +12,7 @@ android/.idea/
 *.keystore
 *.jks
 google-services.json
+# rust agent
+agent/target*/
+agent/node_modules/
+agent/src-tauri/gen/
