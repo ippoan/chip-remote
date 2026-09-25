@@ -26,7 +26,7 @@ Worker には CF Secrets Store binding で渡す (secrets-inventory MCP の `syn
 ```
 located_pending ──(agent: chip.located)──▶ notified ──(phone: action)──▶ acting ──▶ done / failed
       │                     │                                                │
-      └──(agent: chip.not_found, 60s)──▶ notified (located=false)            │
+      └──(agent: chip.not_found, 5s)───▶ notified (located=false)            │
 any ──(hook: DELETE)──▶ withdrawn                                            │
 ```
 
@@ -110,7 +110,7 @@ hibernatable WebSocket。同時接続は 1 本 (新しい接続が来たら古�
 | type | 中身 | 意味 |
 |---|---|---|
 | `chip.located` | `{ task_id, pane_title? }` | UIA で chip を見つけた → Worker が FCM 通知 (`located=true`) |
-| `chip.not_found` | `{ task_id }` | 60 秒探して無かった → Worker が FCM 通知 (`located=false`) |
+| `chip.not_found` | `{ task_id }` | 画面を動かさずに探して無かった (既定 5 秒) → Worker が FCM 通知 (`located=false`) |
 | `action.result` | `{ request_id, task_id, ok, error? }` | ボタンを押した結果 |
 | `pong` | `{}` | |
 
@@ -168,7 +168,7 @@ agent は StatusBar の後ろの兄弟を、次の StatusBar か「開始」以�
 - **ウィンドウが他のウィンドウに完全に隠れている / 最小化 / ディスプレイ電源 OFF の間、Chromium は描画を止め、
   その間に出た chip は木に反映されない。** agent は探す・押す直前に
   (1) `ES_DISPLAY_REQUIRED` でディスプレイを起こし、(2) Claude のウィンドウを TOPMOST (非アクティブ) にし、
-  (3) 1px 動かして戻す (Chromium は重なり順の変化だけでは再計算しない。位置変更イベントで ~0.3 秒で再描画)。
+  (3) 1px 動かして戻す。**これはスマホから action が来たときだけ** (chip が出た時点ではユーザーが PC にいるので窓を動かさない) (Chromium は重なり順の変化だけでは再計算しない。位置変更イベントで ~0.3 秒で再描画)。
   終わったら TOPMOST を外して元の前面ウィンドウの後ろに戻す。
 - ボタンを InvokePattern で押すと Chromium がフォーカスを移すため、**Claude のウィンドウがアクティブになる**。
 - 画面ロック中は対象外 (描画されない)。agent は常駐中 `ES_SYSTEM_REQUIRED` でスリープだけ防ぐ

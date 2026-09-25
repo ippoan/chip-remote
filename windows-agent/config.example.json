@@ -7,7 +7,7 @@
     "dismiss": "提案を非表示",
     "next": "次の提案を表示"
   },
-  "locateTimeoutSec": 60,
+  "locateTimeoutSec": 5,
   "scanIntervalSec": 2,
   "takeoverBackoffSec": 300,
   "raiseWaitSec": 5,
