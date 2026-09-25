@@ -1,0 +1,1 @@
+{"session_id":null,"cwd":"/home/claude/work/chip-remote","hook_event_name":"PostToolUse","tool_name":"mcp__ccd_session__spawn_task","tool_input":{"title":"テストを追加","tldr":"カバレッジが足りない。"},"tool_response":[{"type":"text","text":"Noted (position 3, task_id: task_ffee0011)."}]}

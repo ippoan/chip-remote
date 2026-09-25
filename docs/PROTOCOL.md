@@ -80,6 +80,18 @@ hibernatable WebSocket。同時接続は 1 本 (新しい接続が来たら古�
 
 `{ "ok": true, "agent_connected": bool }`。認証なし。
 
+### レスポンスとエラーの細則
+
+- `POST /v1/chips` (201/200) と `DELETE` (200) は `{ "chip": Chip }`。`POST /v1/devices` は `{ "ok": true }` (新規 201 / 更新 200)。
+- エラーは `{ "error": code }`: 400 `invalid_request` / 401 `unauthorized` / 404 `not_found` (未知の task_id) /
+  426 `expected_websocket` / 503 `token_not_configured` / 500 `internal`。action の判定順は 400 → 404 → `agent_offline` → `chip_closed`。
+- 既に `withdrawn` の chip への DELETE は 200 で、agent・FCM へは再送しない。
+- `located=false` で通知済みの chip に後から `chip.located` が来たら、同じ通知 ID で `located=true` の `chip` を送り直す
+  (`acting` 中などは located だけ更新して通知しない)。
+- `request_id` が合わない `action.result` は古い結果として無視。
+- `failed` は open 一覧と `hello` に含め、再度の action を受け付ける。成功した action は start / dismiss とも `done`。
+- Worker 側にも locate の安全網 `LOCATE_TIMEOUT_MS` (既定 75 秒) がある。agent から報告が無ければ `located=false` で通知する。
+
 ## WebSocket メッセージ (JSON text)
 
 ### Worker → agent
@@ -126,16 +138,21 @@ hibernatable WebSocket。同時接続は 1 本 (新しい接続が来たら古�
 実測。ラベル文字列は UI の言語で変わるので agent の設定ファイルに外出しする。
 
 ```
-StatusBar (chip 全体)
-  Text   "推奨タスク"
-  Text   <title>
-  Group
-    Text <tldr>
-  Button "提案を非表示"             ← dismiss
-  Group  "ワークツリーで開始"
-    Button "ワークツリーで開始"      ← start (InvokePattern 対応)
+Group (チャットペインのコンテナ)
+  StatusBar                          ← chip の本文
+    Text   "推奨タスク"
+    Text   <title>
+    Group
+      Text <tldr>
+  Button "提案を非表示"               ← dismiss (StatusBar の「兄弟」)
+  Group  "ワークツリーで開始"          ← (同じく兄弟)
+    Button "ワークツリーで開始"        ← start (InvokePattern 対応)
     Button "その他の開始オプション"
+  Group  "チャットメッセージ"
 ```
+
+ボタンは StatusBar の子ではなく、直後に並ぶ兄弟要素 (2026-09-25 の実機で確認)。
+agent は StatusBar の後ろの兄弟を、Button か開始用の Group である間だけたどって、その chip のボタンとして扱う。
 
 - 探索範囲は Claude のメインウィンドウ (`claude.exe` の `MainWindowHandle`) の Descendants。
 - Chromium は UIA クライアントを検知してから遅延でアクセシビリティ木を構築するので、

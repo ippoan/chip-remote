@@ -1,0 +1,40 @@
+name: CI
+
+# 他 ippoan worker repo (cdp-relay 等) と同じ frontend-ci.yml caller pattern。
+# Single-env 運用: staging = prod。PR merge (push: main) も tag push も同じ
+# `wrangler deploy` で同一 worker (chip-remote) に出す。
+#
+# paths-ignore (android/** 等) は付けない: required check が skip されると PR が
+# pending のまま merge できなくなるため。android / windows-agent / hooks の CI は
+# 必要になったら別 workflow で足す。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+# frontend-ci.yml は内蔵 auto-merge / secret-verify を持つため
+# top-level で contents:write + pull-requests:write + id-token:write が必須
+# (ci-workflows/CLAUDE.md "Option A" 参照)。
+permissions:
+  contents: write
+  pull-requests: write
+  packages: read
+  id-token: write
+
+jobs:
+  ci:
+    uses: ippoan/ci-workflows/.github/workflows/frontend-ci.yml@main
+    with:
+      project_type: worker
+      install_command: 'npm install'
+      typecheck_command: 'npx tsc --noEmit'
+      has_tests: true
+      post_install_script: 'npx wrangler types'
+      # Single-env (staging = prod)。staging / release どちらも同じ chip-remote
+      # worker へ deploy する (別 env や --env staging は持たない)。
+      deploy_staging_script: 'npx wrangler deploy'
+      deploy_release_script: 'npx wrangler deploy'
+    secrets: inherit

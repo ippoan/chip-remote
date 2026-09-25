@@ -1,0 +1,124 @@
+name: Android
+
+on:
+  pull_request:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-${{ github.event.pull_request.number || github.ref }}
+  # main の publish を途中で止めない
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      # google-services.json (SoT は GCP cloudsql-sv の CHIP_REMOTE_GOOGLE_SERVICES_JSON) を
+      # 丸ごと 1 つの secret で受け、このアプリの client だけ取り出して FIREBASE_* に展開する。
+      # 未設定でもビルドは通る (アプリが「Firebase 未設定」と表示するだけ)。
+      - name: Firebase config (if configured)
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GOOGLE_SERVICES_JSON" ]; then
+            echo "::notice::GOOGLE_SERVICES_JSON is not set; Firebase disabled in this build"
+            exit 0
+          fi
+          pick() { printf '%s' "$GOOGLE_SERVICES_JSON" | jq -er "$1"; }
+          client='.client[] | select(.client_info.android_client_info.package_name == "org.ippoan.chipremote")'
+          app_id=$(pick "$client | .client_info.mobilesdk_app_id")
+          api_key=$(pick "$client | .api_key[0].current_key")
+          sender_id=$(pick '.project_info.project_number')
+          project_id=$(pick '.project_info.project_id')
+          for v in "$app_id" "$api_key"; do echo "::add-mask::$v"; done
+          {
+            echo "FIREBASE_APP_ID=$app_id"
+            echo "FIREBASE_API_KEY=$api_key"
+            echo "FIREBASE_SENDER_ID=$sender_id"
+            echo "FIREBASE_PROJECT_ID=$project_id"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Windows で作ったファイルは実行ビットが落ちていることがある
+      - run: chmod +x gradlew
+
+      - name: Restore keystore (if configured)
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::ANDROID_KEYSTORE_BASE64 is not set; building debug APK"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Unit tests
+        run: ./gradlew testDebugUnitTest
+
+      - name: Build signed release APK
+        if: steps.keystore.outputs.signed == 'true'
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk dist/chip-remote.apk
+
+      - name: Build debug APK
+        if: steps.keystore.outputs.signed != 'true'
+        run: |
+          ./gradlew assembleDebug
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/chip-remote.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chip-remote-apk
+          path: android/dist/chip-remote.apk
+          if-no-files-found: error
+
+      - name: Publish android-latest release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED: ${{ steps.keystore.outputs.signed }}
+        run: |
+          set -euo pipefail
+          kind=$([ "$SIGNED" = "true" ] && echo "release (signed)" || echo "debug (CI の使い捨て debug 鍵。上書きインストール不可)")
+          # tag を今の commit に付け直すため、作り直す
+          gh release delete android-latest --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/android-latest" >/dev/null 2>&1 || true
+          gh release create android-latest dist/chip-remote.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Android (latest)" \
+            --notes "main ${GITHUB_SHA::7} / run ${GITHUB_RUN_NUMBER} / ${kind}" \
+            --prerelease

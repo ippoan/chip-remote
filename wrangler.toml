@@ -1,0 +1,56 @@
+name = "chip-remote"
+main = "src/index.ts"
+# Hono / DO SQLite / WebSocketPair / crypto.subtle (RS256 署名・定数時間比較) は
+# すべて標準 Workers API なので nodejs_compat は本来不要だが、テスト
+# (@cloudflare/vitest-pool-workers) が nodejs_compat を必須とするため本番も揃える。
+compatibility_date = "2025-05-01"
+compatibility_flags = ["nodejs_compat"]
+# 他 ippoan worker と同じアカウント。
+account_id = "24b45709d060d957340180e995f0d373"
+
+# workers.dev サブドメインも有効化しておく (custom domain 反映前の fallback /
+# 疎通確認用)。一次エンドポイントは下の custom domain (chip-remote.ippoan.org)。
+workers_dev = true
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# ─── Secrets (すべて `wrangler secret put <NAME>` で投入する plain worker secret) ─────
+# CHIP_REMOTE_TOKEN  … hook / agent / phone 共通の Bearer token。未設定なら /health 以外
+#                      すべて 503 (fail-closed)。
+# FCM_PRIVATE_KEY    … FCM 送信用 service account の private_key (PKCS8 PEM)。
+#                      JSON の "\n" エスケープのまま貼っても src/fcm.ts が改行に戻す。
+# FCM_CLIENT_EMAIL   … 同 service account の client_email (secret でも var でも可)。
+# FCM_PRIVATE_KEY / FCM_CLIENT_EMAIL が未設定なら FCM 送信は log してスキップする
+# (agent / hook の経路はそのまま動く)。
+#
+# `[secrets] required` は **使わない**: wrangler 4.79+ はこれを worker-scoped
+# secret 宣言と解釈し、未 set だと "required secret not set" で deploy が落ちる
+# (Refs ippoan/mcp-relay-rs#21、cdp-relay / HealthConnectReaderWorker と同様)。
+
+# ─── 設定値 (文字列 vars。未設定なら src/env.ts の default) ───────────────────
+[vars]
+# FCM HTTP v1 の送信先 Firebase project (alc-app と同じ project を共用)。
+FCM_PROJECT_ID = "alc-fcm"
+# phone の action を agent が処理するまでの待ち時間 (ms)。超過で failed / agent_timeout。
+ACTION_TIMEOUT_MS = "30000"
+# agent が chip.located / chip.not_found を返すまでの安全網 (ms)。agent は 60 秒探すので
+# それより長く取る。超過したら located=false で FCM 通知する。
+LOCATE_TIMEOUT_MS = "75000"
+
+# ─── Durable Object: 全体で 1 個 (idFromName("hub")) ─────────────────────────
+# chip / device を SQLite に保持し、agent WS を hibernatable に hold する。
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "HubDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["HubDO"]
+
+# Custom domain (一次エンドポイント)。`wrangler deploy` が ippoan.org ゾーンに
+# DNS record + worker route を自動生成する (cdp-relay.ippoan.org と同じパターン)。
+[[routes]]
+pattern = "chip-remote.ippoan.org"
+custom_domain = true
