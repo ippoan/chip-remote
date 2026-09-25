@@ -1,0 +1,14 @@
+node_modules/
+.wrangler/
+.dev.vars
+coverage/
+worker-configuration.d.ts
+# android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.keystore
+*.jks
+google-services.json
