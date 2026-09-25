@@ -36,9 +36,9 @@
       "endpoints": [
         "https://github.com/ippoan/chip-remote/releases/download/agent-latest/latest.json"
       ],
-      "pubkey": "REPLACE_WITH_TAURI_SIGNER_PUBKEY",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE4NjUzOTg5RkFBMkY4MEMKUldRTStLTDZpVGxsR0Q0WlVaZmV1UThtZ0VvV3ZmeFpoSDdmTjJUWStsMmZPRnBCaXZodVNKU3kK",
       "windows": {
-        "installMode": "passive"
+        "installMode": "quiet"
       }
     }
   }

@@ -251,12 +251,13 @@ impl Uia {
                 })?
             }
         };
-        let label = match action {
-            Action::Start => &self.labels.start,
-            Action::Dismiss => &self.labels.dismiss,
-        };
         // InvokePattern on a Chromium button moves focus: Claude becomes active (accepted).
-        self.invoke_button(&hit.element, label)
+        match action {
+            Action::Start => {
+                self.invoke_button(&hit.element, |n| logic::is_start_label(n, &self.labels))
+            }
+            Action::Dismiss => self.invoke_button(&hit.element, |n| n == self.labels.dismiss),
+        }
     }
 
     // ------------------------------------------------------------------ internals
@@ -457,7 +458,7 @@ impl Uia {
             }
             let mut pressed: HashMap<i32, String> = HashMap::new();
             for i in pager.plan(&list, next) {
-                if self.invoke_button(&chips[i].element, next).is_ok() {
+                if self.invoke_button(&chips[i].element, |n| n == next).is_ok() {
                     pressed.insert(list[i].pane_x, list[i].title.clone());
                 }
             }
@@ -566,7 +567,11 @@ impl Uia {
         out
     }
 
-    fn invoke_button(&self, chip: &IUIAutomationElement, label: &str) -> Result<(), ActionError> {
+    fn invoke_button(
+        &self,
+        chip: &IUIAutomationElement,
+        is_target: impl Fn(&str) -> bool,
+    ) -> Result<(), ActionError> {
         // A stale element (chip gone since it was read) fails every property read.
         if unsafe { chip.CurrentControlType() }.is_err() {
             return Err(ActionError::ChipNotFound);
@@ -574,7 +579,7 @@ impl Uia {
         let btn = self
             .chip_buttons(chip)
             .into_iter()
-            .find(|b| name(b) == label)
+            .find(|b| is_target(&name(b)))
             .ok_or(ActionError::ButtonNotFound)?;
         self.invoke(&btn)
     }

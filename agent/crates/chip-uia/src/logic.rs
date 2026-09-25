@@ -66,10 +66,26 @@ pub enum SiblingStep {
     Stop,
 }
 
+/// Is `name` the chip's start button (or the group that wraps it)? The configured label,
+/// or any name ending with `labels.start_suffix` except the "more options" button
+/// (SSH sessions read "mini-ryzen-claudeでworktreeを使って開始").
+pub fn is_start_label(name: &str, labels: &Labels) -> bool {
+    if name == labels.start {
+        return true;
+    }
+    let suffix = labels.start_suffix.as_str();
+    !suffix.is_empty() && name.ends_with(suffix) && !name.contains(MORE_OPTIONS_MARK)
+}
+
+/// "その他の開始オプション" ends with オプション, but guard anyway in case the UI changes.
+const MORE_OPTIONS_MARK: &str = "その他";
+
 pub fn sibling_step(kind: Kind, name: &str, labels: &Labels) -> SiblingStep {
     match kind {
         Kind::Button => SiblingStep::TakeButton,
-        Kind::Group if name.is_empty() || name == labels.start => SiblingStep::TakeGroupButtons,
+        Kind::Group if name.is_empty() || is_start_label(name, labels) => {
+            SiblingStep::TakeGroupButtons
+        }
         Kind::Text => SiblingStep::Skip,
         _ => SiblingStep::Stop,
     }
@@ -340,6 +356,7 @@ mod tests {
     fn sibling_walk_uses_configured_start_label() {
         let l = Labels {
             start: "Start in worktree".into(),
+            start_suffix: String::new(),
             ..Labels::default()
         };
         assert_eq!(
@@ -350,6 +367,32 @@ mod tests {
             sibling_step(Kind::Group, "ワークツリーで開始", &l),
             SiblingStep::Stop
         );
+    }
+
+    #[test]
+    fn start_label_matches_local_and_ssh_wording() {
+        let l = labels();
+        assert!(is_start_label("ワークツリーで開始", &l));
+        assert!(is_start_label(
+            "mini-ryzen-claudeでworktreeを使って開始",
+            &l
+        ));
+        assert!(!is_start_label("その他の開始オプション", &l));
+        assert!(!is_start_label("提案を非表示", &l));
+        assert!(!is_start_label("開始済み 3セッション", &l));
+        // the SSH start group is walked into, not treated as the chat list
+        assert_eq!(
+            sibling_step(Kind::Group, "mini-ryzen-claudeでworktreeを使って開始", &l),
+            SiblingStep::TakeGroupButtons
+        );
+        let no_suffix = Labels {
+            start_suffix: String::new(),
+            ..Labels::default()
+        };
+        assert!(!is_start_label(
+            "mini-ryzen-claudeでworktreeを使って開始",
+            &no_suffix
+        ));
     }
 
     #[test]

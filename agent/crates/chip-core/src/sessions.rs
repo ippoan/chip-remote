@@ -15,9 +15,10 @@
 //!
 //! [`parse_session`] reads one file defensively (a partial write is an error → the
 //! caller retries next round); [`diff`] turns two snapshots of the same file into
-//! [`ChipEvent`]s.
+//! [`ChipEvent`]s; [`SessionIndex`] answers "where does this task stand" across all
+//! files (used to close Worker chips that were resolved while nobody reported it).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -253,6 +254,65 @@ pub fn diff(prev: Option<&SessionChips>, cur: Option<&SessionChips>) -> Vec<Chip
     out
 }
 
+/// Where a task_id stands across every session file ([`SessionIndex::presence`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presence {
+    /// Pending in some (non-archived) session.
+    Pending,
+    /// Not pending anywhere, but listed in some `resolvedBackgroundTaskSuggestions`.
+    Resolved(Resolution),
+    /// In no session file at all (an archived session's pending chip counts as absent).
+    Absent,
+}
+
+/// Pending / resolved task_ids of a set of session files (a whole sessions directory).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionIndex {
+    pending: HashSet<String>,
+    resolved: HashMap<String, Resolution>,
+}
+
+impl SessionIndex {
+    pub fn from_sessions<'a, I>(sessions: I) -> SessionIndex
+    where
+        I: IntoIterator<Item = &'a SessionChips>,
+    {
+        let mut idx = SessionIndex::default();
+        for s in sessions {
+            idx.add(s);
+        }
+        idx
+    }
+
+    pub fn add(&mut self, s: &SessionChips) {
+        for c in s.active_pending() {
+            self.pending.insert(c.task_id.clone());
+        }
+        for (id, r) in &s.resolved {
+            self.resolved.entry(id.clone()).or_insert_with(|| r.clone());
+        }
+    }
+
+    /// Pending anywhere wins over resolved elsewhere.
+    pub fn presence(&self, task_id: &str) -> Presence {
+        if self.pending.contains(task_id) {
+            Presence::Pending
+        } else if let Some(r) = self.resolved.get(task_id) {
+            Presence::Resolved(r.clone())
+        } else {
+            Presence::Absent
+        }
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn resolved_len(&self) -> usize {
+        self.resolved.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +508,28 @@ mod tests {
         );
         // Un-archiving brings the chip back.
         assert_eq!(diff(Some(&archived), Some(&a)).len(), 1);
+    }
+
+    #[test]
+    fn index_presence_across_files() {
+        let a = session(&["task_1"], &[("task_2", "dismissed")]);
+        let b = session(&["task_2"], &[("task_3", "started_notified")]);
+        let mut archived = session(&["task_4"], &[]);
+        archived.archived = true;
+        let idx = SessionIndex::from_sessions([&a, &b, &archived]);
+        assert_eq!(idx.presence("task_1"), Presence::Pending);
+        assert_eq!(
+            idx.presence("task_2"),
+            Presence::Pending,
+            "pending in one file wins over resolved in another"
+        );
+        assert_eq!(
+            idx.presence("task_3"),
+            Presence::Resolved(Resolution::Started)
+        );
+        assert_eq!(idx.presence("task_4"), Presence::Absent);
+        assert_eq!(idx.presence("task_9"), Presence::Absent);
+        assert_eq!((idx.pending_len(), idx.resolved_len()), (2, 2));
+        assert_eq!(SessionIndex::default().presence("task_1"), Presence::Absent);
     }
 }

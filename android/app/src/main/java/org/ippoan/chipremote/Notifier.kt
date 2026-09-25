@@ -23,6 +23,13 @@ object Notifier {
     private const val EXTRA_CWD = "chip.cwd"
     private const val EXTRA_HOST = "chip.host"
     private const val EXTRA_LOCATED = "chip.located"
+    /** 通知が今どの段階を表示しているか。202 と FCM chip_result の到着順の逆転を見分けるのに使う。 */
+    private const val EXTRA_STAGE = "chip.stage"
+    private const val STAGE_CHIP = "chip"
+    private const val STAGE_SENDING = "sending"
+    private const val STAGE_ACCEPTED = "accepted"
+    private const val STAGE_DONE = "done"
+    private const val STAGE_ERROR = "error"
 
     private const val NOT_LOCATED_SUFFIX = "(画面で chip を確認できていません)"
     private const val DONE_TIMEOUT_MS = 5_000L
@@ -35,24 +42,37 @@ object Notifier {
     }
 
     /** 新規 chip: 「開始」「非表示」付きで鳴らす。 */
-    fun showChip(ctx: Context, chip: ChipNotice) = post(ctx, chip, status = null, actions = true)
+    fun showChip(ctx: Context, chip: ChipNotice) = post(ctx, chip, STAGE_CHIP, status = null, actions = true)
 
     /** action 送信中: ボタンを消す。 */
-    fun showSending(ctx: Context, chip: ChipNotice) = post(ctx, chip, status = "送信中…", actions = false)
+    fun showSending(ctx: Context, chip: ChipNotice) = post(ctx, chip, STAGE_SENDING, status = "送信中…", actions = false)
 
-    /** Worker が受け付けた (202)。agent の結果が chip_result で届くまでボタンは出さない。 */
-    fun showAccepted(ctx: Context, chip: ChipNotice) =
-        post(ctx, chip, status = "Windows で処理中…", actions = false)
+    /**
+     * Worker が受け付けた (202)。agent の結果が chip_result で届くまでボタンは出さない。
+     * PC 側は 1 秒未満で押し終わるので、chip_result (FCM) が 202 より先に届くことがある。
+     * そのとき「処理中」で上書きすると結果が消えて止まって見えるため、まだ「送信中」のときだけ出す。
+     */
+    fun showAcceptedIfStillSending(ctx: Context, chip: ChipNotice) {
+        if (currentStage(ctx, chip.taskId) != STAGE_SENDING) return
+        post(ctx, chip, STAGE_ACCEPTED, status = "Windows で処理中…", actions = false)
+    }
 
     /** 成功: 数秒で自動的に消える。 */
     fun showDone(ctx: Context, chip: ChipNotice, action: String) =
-        post(ctx, chip, status = actionDoneLabel(action), actions = false, timeoutMs = DONE_TIMEOUT_MS)
+        post(ctx, chip, STAGE_DONE, status = actionDoneLabel(action), actions = false, timeoutMs = DONE_TIMEOUT_MS)
 
     /** 失敗: メッセージを出してボタンを戻す (もう一度押せる)。 */
     fun showError(ctx: Context, chip: ChipNotice, message: String) =
-        post(ctx, chip, status = message, actions = true)
+        post(ctx, chip, STAGE_ERROR, status = message, actions = true)
 
     fun cancel(ctx: Context, taskId: String) = manager(ctx).cancel(notificationId(taskId))
+
+    /** 表示中の通知の段階。通知が無ければ null。 */
+    private fun currentStage(ctx: Context, taskId: String): String? {
+        val id = notificationId(taskId)
+        return manager(ctx).activeNotifications.firstOrNull { it.id == id }?.notification?.extras
+            ?.getString(EXTRA_STAGE)
+    }
 
     /** 表示中の通知から chip を復元する。通知が既に消されていれば null。 */
     fun findChip(ctx: Context, taskId: String): ChipNotice? {
@@ -83,7 +103,14 @@ object Notifier {
         )
     }
 
-    private fun post(ctx: Context, chip: ChipNotice, status: String?, actions: Boolean, timeoutMs: Long = 0) {
+    private fun post(
+        ctx: Context,
+        chip: ChipNotice,
+        stage: String,
+        status: String?,
+        actions: Boolean,
+        timeoutMs: Long = 0,
+    ) {
         val id = notificationId(chip.taskId)
         val body = buildString {
             if (status != null) append(status).append('\n')
@@ -101,7 +128,7 @@ object Notifier {
             // 状態更新 (送信中→結果) のたびに鳴らさない
             .setOnlyAlertOnce(true)
             .setContentIntent(openAppIntent(ctx))
-            .addExtras(toBundle(chip))
+            .addExtras(toBundle(chip).apply { putString(EXTRA_STAGE, stage) })
         if (actions) {
             builder.addAction(0, "開始", actionIntent(ctx, chip, ActionReceiver.ACTION_START))
             builder.addAction(0, "非表示", actionIntent(ctx, chip, ActionReceiver.ACTION_DISMISS))

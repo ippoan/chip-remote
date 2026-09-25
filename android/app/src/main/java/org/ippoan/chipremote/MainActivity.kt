@@ -1,7 +1,9 @@
 package org.ippoan.chipremote
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -11,11 +13,15 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.google.firebase.messaging.FirebaseMessaging
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -29,6 +35,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var emptyText: TextView
     private lateinit var chipList: LinearLayout
     private lateinit var swipe: SwipeRefreshLayout
+    private lateinit var updateButton: Button
+    private lateinit var updateStatus: TextView
+
+    /** 確認済みの新しい版 (無ければ null)。ボタンが「vX に更新」になる。 */
+    private var availableUpdate: UpdateInfo? = null
+    /** 「更新を確認」の結果など、Updater が Idle のときに出す文言。 */
+    private var updateMessage: String = ""
+    /** 「不明なアプリのインストール」の設定画面から戻ったら更新を続ける。 */
+    private var resumeUpdateAfterSettings = false
 
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -57,12 +72,131 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.refresh_button).setOnClickListener { refresh() }
         swipe.setOnRefreshListener { refresh() }
 
+        updateButton = findViewById(R.id.update_button)
+        updateStatus = findViewById(R.id.update_status)
+        findViewById<TextView>(R.id.version_text).text =
+            "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})"
+        updateButton.setOnClickListener {
+            val info = availableUpdate
+            if (info != null) startUpdate(info) else checkUpdate(manual = true)
+        }
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                Updater.state.collect { renderUpdate(it) }
+            }
+        }
+
         requestNotificationPermission()
+        if (savedInstanceState == null) handleUpdateIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleUpdateIntent(intent)
     }
 
     override fun onResume() {
         super.onResume()
+        Updater.foreground = true
         refresh()
+        if (resumeUpdateAfterSettings) {
+            resumeUpdateAfterSettings = false
+            availableUpdate?.takeIf { packageManager.canRequestPackageInstalls() }?.let { startUpdate(it) }
+        } else if (System.currentTimeMillis() - lastAutoCheckAt > AUTO_CHECK_INTERVAL_MS) {
+            lastAutoCheckAt = System.currentTimeMillis()
+            checkUpdate(manual = false)
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        Updater.foreground = false
+    }
+
+    /** 更新通知のタップ: 最新の version.json を取り直してそのまま更新に進む。 */
+    private fun handleUpdateIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_START_UPDATE, false) != true) return
+        intent.removeExtra(EXTRA_START_UPDATE)
+        UpdateChecker.cancelNotification(this)
+        lifecycleScope.launch {
+            val info = fetchUpdate() ?: return@launch
+            if (isNewer(info, BuildConfig.VERSION_CODE)) startUpdate(info) else setUpdateMessage("最新です")
+        }
+    }
+
+    /** manual = false (起動時) は通知の 1 日 1 回制限つき。どちらも結果を画面に出す。 */
+    private fun checkUpdate(manual: Boolean) {
+        if (Updater.busy) return
+        if (manual) setUpdateMessage("更新を確認中…")
+        lifecycleScope.launch {
+            val info = if (manual) {
+                // 失敗時は fetchUpdate が画面に出している
+                val latest = fetchUpdate() ?: return@launch
+                latest.takeIf { isNewer(it, BuildConfig.VERSION_CODE) }
+            } else {
+                try {
+                    UpdateChecker.checkAndNotify(this@MainActivity)
+                } catch (e: Exception) {
+                    // 起動時の確認は黙って失敗する (オフラインなど)
+                    UpdateChecker.logFailure(e)
+                    return@launch
+                }
+            }
+            availableUpdate = info
+            when {
+                info != null -> setUpdateMessage("更新があります: ${info.label}")
+                manual -> setUpdateMessage("最新です")
+                else -> renderUpdate(Updater.state.value)
+            }
+        }
+    }
+
+    /** 手動確認・通知タップ用。失敗は画面に出して null。 */
+    private suspend fun fetchUpdate(): UpdateInfo? = try {
+        UpdateChecker.fetch()
+    } catch (e: Exception) {
+        setUpdateMessage("更新の確認に失敗: ${e.message ?: e.javaClass.simpleName}")
+        null
+    }
+
+    private fun startUpdate(info: UpdateInfo) {
+        availableUpdate = info
+        if (!packageManager.canRequestPackageInstalls()) {
+            AlertDialog.Builder(this)
+                .setTitle("更新の許可")
+                .setMessage("更新を入れるには、chip-remote に「不明なアプリのインストール」を許可してください (初回のみ)。許可したら戻ってください。")
+                .setPositiveButton("設定を開く") { _, _ ->
+                    resumeUpdateAfterSettings = true
+                    startActivity(
+                        Intent(
+                            android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:$packageName"),
+                        )
+                    )
+                }
+                .setNegativeButton("キャンセル", null)
+                .show()
+            return
+        }
+        Updater.start(this, info)
+    }
+
+    private fun setUpdateMessage(text: String) {
+        updateMessage = text
+        renderUpdate(Updater.state.value)
+    }
+
+    private fun renderUpdate(state: UpdateState) {
+        val text = when (state) {
+            UpdateState.Idle -> updateMessage
+            is UpdateState.Downloading -> "${state.info.label} をダウンロード中… ${state.percent}%"
+            is UpdateState.Installing -> "インストール画面で「更新」を押してください"
+            is UpdateState.Failed -> state.message
+        }
+        updateStatus.text = text
+        updateStatus.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
+        updateButton.isEnabled = state !is UpdateState.Downloading
+        updateButton.text = availableUpdate?.let { "${it.label} に更新" } ?: "更新を確認"
     }
 
     private fun requestNotificationPermission() {
@@ -140,18 +274,28 @@ class MainActivity : AppCompatActivity() {
     private fun act(chip: Chip, action: String) {
         val client = saveSettings() ?: return
         setStatus("送信中… (${chip.title})")
+        Notifier.showSending(this, chip.toNotice())
         lifecycleScope.launch {
             when (val r = client.postAction(chip.taskId, action)) {
                 ActionOutcome.Accepted -> {
                     setStatus("Windows に送信しました (結果は通知で届きます)")
-                    Notifier.showAccepted(this@MainActivity, chip.toNotice())
+                    // chip_result が先に届いていたら上書きしない (Notifier 参照)
+                    Notifier.showAcceptedIfStillSending(this@MainActivity, chip.toNotice())
+                    // PC 側は 1 秒未満で終わるので、少し待って結果を一覧に反映する
+                    delay(2_000)
                 }
-                ActionOutcome.AgentOffline -> setStatus(errorLabel("agent_offline"))
+                ActionOutcome.AgentOffline -> {
+                    setStatus(errorLabel("agent_offline"))
+                    Notifier.showError(this@MainActivity, chip.toNotice(), errorLabel("agent_offline"))
+                }
                 ActionOutcome.ChipClosed -> {
                     setStatus(errorLabel("chip_closed"))
                     Notifier.cancel(this@MainActivity, chip.taskId)
                 }
-                is ActionOutcome.Failed -> setStatus(r.message)
+                is ActionOutcome.Failed -> {
+                    setStatus(r.message)
+                    Notifier.showError(this@MainActivity, chip.toNotice(), r.message)
+                }
             }
             refresh()
         }
@@ -159,6 +303,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun setStatus(text: String) {
         statusText.text = text
+    }
+
+    companion object {
+        /** 更新通知のタップで付く。true なら更新に進む。 */
+        const val EXTRA_START_UPDATE = "start_update"
+
+        /** onResume ごとの自動確認は 10 分に 1 回まで (通知自体は UpdateChecker が 1 日 1 回に絞る)。 */
+        private const val AUTO_CHECK_INTERVAL_MS = 10 * 60 * 1000L
+        private var lastAutoCheckAt = 0L
     }
 
     private suspend fun fcmToken(): String = suspendCancellableCoroutine { cont ->

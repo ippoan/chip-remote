@@ -133,6 +133,30 @@ agent の振る舞い:
   再起動なしで拾うため。その他の 4xx は諦めてログに残す。token はログに出さない。
 - `action` を受けたとき、そのセッションファイルにある chip なら title / tldr はファイルの値 (UI と完全一致) を使い、
   セッションのタイトルも UIA に渡す (目的のセッションのペインを出してから探すため)。
+- **Worker の open chip との突き合わせ (reconcile)**。誰も報告しないまま PC 側で解決された chip
+  (agent 起動前に解決 / hook 由来でファイル差分に乗らなかった等) が Worker で永遠に open のまま残り、
+  スマホの「未処理」から消せなくなる (action → `chip_not_found` → `failed` は open のまま) のを防ぐ。
+  - いつ: `hello` を受けるたび (Worker の open chip = `located_pending` / `notified` / `acting` / `failed`、
+    `created_at` 付き) と、watcher のフルスキャン (監視開始・`sessionsDir` 変更後の最初の完全なラウンド) の直後。
+    全ファイルを一度は読めた (ディレクトリがあり、一覧が完全で、読めないファイルが無い) 後でないと突き合わせない
+    (でないと全部「無い」に見える)。`hello` が先に来たら、最初のフルスキャン直後に最後の `hello` と突き合わせる。
+    `watchSessions=false` の間は突き合わせない。
+  - 判定 (chip ごと):
+    | 状態 | 扱い |
+    |---|---|
+    | Worker 側 `acting` (action 実行中) | 触らない |
+    | agent 自身がスマホの action で押した chip (実行中 / 自分の action で解決済み) | 触らない (DELETE しない) |
+    | どれかのセッションファイルで `backgroundTaskSuggestions` にある | 触らない |
+    | どれかのセッションファイルで `resolvedBackgroundTaskSuggestions` にある | `DELETE /v1/chips/:task_id` |
+    | どのファイルにも無い、かつ `created_at` から 10 分以上 | `DELETE` |
+    | どのファイルにも無い、10 分未満 (または `created_at` 無し) | 触らない (hook がファイルより先に報告した可能性) |
+
+    アーカイブ済みセッションの未解決 chip は「どのファイルにも無い」扱い。
+  - DELETE は既存の再送 (1 秒から倍々、最大 60 秒) で送り、同じ task_id の送信中は重ねない。token はログに出さない。
+    一度 DELETE した chip は次の突き合わせ対象から外す。
+- `action` の task_id がセッションファイルで解決済み (`resolved…` にあり未解決側に無い) なら UI は触らず
+  `action.result` `{ ok: false, error: "chip_not_found" }` を返し、あわせて `DELETE` する (Worker は `failed` → `withdrawn`
+  になり、スマホから消える)。ただし agent 自身が押した chip なら DELETE しない。
 
 ## WebSocket メッセージ (JSON text)
 
@@ -190,7 +214,8 @@ Group (チャットペインのコンテナ)
   Group '' > Button "前の提案を表示"   ┐ 同じセッションに chip が複数あるときだけ出るページ送り。
   Text   "2件中1番目"                 │ 画面に出るのは現在の 1 件だけで、他の chip は
   Group '' > Button "次の提案を表示"   ┘ 「次」を押すまで木に存在しない
-  Group  "ワークツリーで開始"          ← (同じく兄弟)
+  Group  "ワークツリーで開始"          ← (同じく兄弟)。SSH セッションでは "mini-ryzen-claudeでworktreeを使って開始"
+                                       (中の Button も同名)。agent は名前が「開始」で終わるもの (その他の開始オプションを除く) を開始とみなす
     Button "ワークツリーで開始"        ← start (InvokePattern 対応)
     Button "その他の開始オプション"
   Group  "チャットメッセージ"

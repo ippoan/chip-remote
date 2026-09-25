@@ -13,6 +13,12 @@ pub struct Labels {
     pub marker: String,
     /// Start button ("ワークツリーで開始").
     pub start: String,
+    /// Any chip button / group whose name ends with this also counts as "start"
+    /// ("開始"). The start button's text depends on where the session runs: local
+    /// sessions say "ワークツリーで開始", SSH sessions "mini-ryzen-claudeでworktreeを使って開始"
+    /// (measured). Empty disables suffix matching.
+    #[serde(rename = "startSuffix")]
+    pub start_suffix: String,
     /// Dismiss button ("提案を非表示").
     pub dismiss: String,
     /// Pager "next" button shown when a session has several chips ("次の提案を表示").
@@ -24,6 +30,7 @@ impl Default for Labels {
         Labels {
             marker: "推奨タスク".into(),
             start: "ワークツリーで開始".into(),
+            start_suffix: "開始".into(),
             dismiss: "提案を非表示".into(),
             next: "次の提案を表示".into(),
         }

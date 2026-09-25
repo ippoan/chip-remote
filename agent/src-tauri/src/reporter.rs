@@ -7,6 +7,9 @@
 //! restart). Network errors, 5xx, 408, 429 and 401 / 403 are retried with a backoff
 //! (1 → 2 → … → 60 s); other 4xx give up. The token is never logged.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chip_core::Config;
@@ -161,6 +164,53 @@ where
         );
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(policy.max);
+    }
+}
+
+/// Fire-and-forget `DELETE /v1/chips/:task_id` for the reconcile (hello / full scan /
+/// an action on a chip already resolved on the PC). Each runs [`deliver`] on its own
+/// task (so a retrying DELETE never blocks the WS loop or the watcher); a task_id
+/// already being delivered is not queued twice.
+#[derive(Clone)]
+pub struct Withdrawer(Arc<WithdrawInner>);
+
+struct WithdrawInner {
+    config_path: PathBuf,
+    client: Client,
+    retry: RetryPolicy,
+    in_flight: Mutex<HashSet<String>>,
+}
+
+impl Withdrawer {
+    pub fn new(config_path: PathBuf, retry: RetryPolicy) -> Withdrawer {
+        Withdrawer(Arc::new(WithdrawInner {
+            config_path,
+            client: client(),
+            retry,
+            in_flight: Mutex::new(HashSet::new()),
+        }))
+    }
+
+    /// Queues the DELETE (needs a tokio runtime). `why` is for the log.
+    pub fn withdraw(&self, task_id: String, why: &str) {
+        {
+            let mut f = self.0.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            if !f.insert(task_id.clone()) {
+                return;
+            }
+        }
+        tracing::info!("reconcile: withdrawing {task_id} ({why})");
+        let inner = self.0.clone();
+        tokio::spawn(async move {
+            let load = || Config::load(&inner.config_path).ok();
+            let job = Job::Delete(task_id);
+            deliver(&inner.client, load, &job, inner.retry).await;
+            inner
+                .in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(job.task_id());
+        });
     }
 }
 
@@ -379,6 +429,56 @@ mod tests {
         assert_eq!(r[0].method, "DELETE");
         assert_eq!(r[0].path, "/v1/chips/task_9");
         assert_eq!(r.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn withdrawer_deletes_once_per_task_while_in_flight() {
+        let srv = start().await;
+        let dir = std::env::temp_dir().join(format!(
+            "chip-remote-withdraw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            json!({"url": srv.url, "token": "secret-token"}).to_string(),
+        )
+        .unwrap();
+        // First attempt 503 → retried; a second request for the same task meanwhile is
+        // not queued again.
+        srv.script(&[503]);
+        let w = Withdrawer::new(path, fast());
+        w.withdraw("task_1".into(), "test");
+        w.withdraw("task_1".into(), "test");
+        let wait = |n: usize| {
+            let srv = srv.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while srv.requests().len() < n {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("requests")
+            }
+        };
+        wait(2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let r = srv.requests();
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r
+            .iter()
+            .all(|x| x.method == "DELETE" && x.path == "/v1/chips/task_1"));
+        assert_eq!(r[0].auth.as_deref(), Some("Bearer secret-token"));
+        // Delivered: a later withdraw is sent again (the Worker answers 200 / 404).
+        w.withdraw("task_1".into(), "test");
+        wait(3).await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

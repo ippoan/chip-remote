@@ -28,7 +28,7 @@ class ActionReceiver : BroadcastReceiver() {
         scope.launch {
             try {
                 when (val r = client.postAction(chip.taskId, action)) {
-                    ActionOutcome.Accepted -> Notifier.showAccepted(ctx, chip)
+                    ActionOutcome.Accepted -> Notifier.showAcceptedIfStillSending(ctx, chip)
                     ActionOutcome.AgentOffline -> Notifier.showError(ctx, chip, errorLabel("agent_offline"))
                     ActionOutcome.ChipClosed -> Notifier.cancel(ctx, chip.taskId)
                     is ActionOutcome.Failed -> Notifier.showError(ctx, chip, r.message)
