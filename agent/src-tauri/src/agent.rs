@@ -9,6 +9,11 @@
 //!   `chip.withdrawn` / `action` drop; every `scanIntervalSec` the queue is matched against
 //!   a read-only UIA listing → `chip.located`, or `chip.not_found` after `locateTimeoutSec`
 //! - `action` → UIA (raises Claude) → `action.result`; `ping` → `pong`
+//! - UIA calls (scans and actions) run off the WS loop: a slow or hung UIA call never
+//!   delays `chip.not_found` (deadlines are checked on every tick, independent of the
+//!   scan), pongs or other messages
+//! - an `action` for a chip the session-file watcher knows ([`ChipBook`]) uses the file's
+//!   exact title / tldr and passes the session title to the driver
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -19,12 +24,14 @@ use chip_core::{select_chip, ActionError, ChipInfo, Config};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::book::ChipBook;
 use crate::driver::DriverHandle;
 use crate::logging::log_view;
 use crate::status::{Status, StatusSink};
@@ -113,6 +120,23 @@ impl Locator {
 
     pub fn task_ids(&self) -> Vec<String> {
         self.items.keys().cloned().collect()
+    }
+
+    /// Deadline passed → `chip.not_found` (leaves the queue). Runs on every tick without
+    /// waiting for UIA, so a slow scan cannot hold a report back.
+    pub fn expire(&mut self, now: Instant) -> Vec<ClientMsg> {
+        let mut out = Vec::new();
+        self.items.retain(|id, item| {
+            if now >= item.deadline {
+                out.push(ClientMsg::ChipNotFound {
+                    task_id: id.clone(),
+                });
+                false
+            } else {
+                true
+            }
+        });
+        out
     }
 
     /// Matches the queue against the chips visible now: found → `chip.located`,
@@ -275,40 +299,60 @@ where
     ws.send(Message::Text(json)).await
 }
 
-#[allow(clippy::result_large_err)]
-async fn locate_scan<S>(
-    ws: &mut WebSocketStream<S>,
-    loc: &mut Locator,
-    driver: &DriverHandle,
-) -> Result<(), WsError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    if loc.is_empty() {
-        return Ok(());
-    }
-    // Read-only: never move the window here. A chip appears while the user is at the
-    // PC, so raising Claude would steal the screen. If the window is covered the chip is
-    // simply not found and the phone gets located=false; the raise happens only for an
-    // action from the phone.
-    let chips = match driver.list_chips().await {
-        Ok(c) => c,
-        Err(ActionError::ClaudeNotRunning) => Vec::new(),
-        Err(e) => {
-            tracing::warn!("scan failed: {e}");
-            Vec::new()
-        }
+/// Result of UIA work running off the WS loop.
+enum Done {
+    Scan(Result<Vec<ChipInfo>, ActionError>),
+    Act {
+        request_id: String,
+        task_id: String,
+        action: Action,
+        result: Result<(), ActionError>,
+    },
+}
+
+/// Title / tldr / session title for an action: the session file's values when the
+/// watcher knows the chip (exact text), else the Worker's.
+pub fn action_target(
+    book: &ChipBook,
+    task_id: &str,
+    title: String,
+    tldr: String,
+) -> (String, Option<String>, Option<String>) {
+    let (title, tldr, session) = match book.get(task_id) {
+        Some(e) if !e.title.is_empty() => (e.title, e.tldr, Some(e.session_title)),
+        Some(e) => (title, tldr, Some(e.session_title)),
+        None => (title, tldr, None),
     };
-    for m in loc.resolve(&chips, Instant::now()) {
-        send(ws, &m).await?;
+    let tldr = (!tldr.is_empty()).then_some(tldr);
+    let session = session.filter(|s| !s.is_empty());
+    (title, tldr, session)
+}
+
+/// Logs the scan outcome only when it changes (a scan runs every tick while chips wait).
+#[derive(Default)]
+struct ScanLog(Option<String>);
+
+impl ScanLog {
+    fn note(&mut self, r: &Result<Vec<ChipInfo>, ActionError>, waiting: &[String]) {
+        let line = match r {
+            Ok(c) => format!("scan: {} chip(s) visible; waiting {:?}", c.len(), waiting),
+            Err(e) => format!("scan: {e}; waiting {waiting:?}"),
+        };
+        if self.0.as_deref() != Some(line.as_str()) {
+            match r {
+                Ok(_) | Err(ActionError::ClaudeNotRunning) => tracing::info!("{line}"),
+                Err(_) => tracing::warn!("{line}"),
+            }
+            self.0 = Some(line);
+        }
     }
-    Ok(())
 }
 
 /// Runs one connected session until the socket closes or fails.
 pub async fn run_session<S>(
     ws: &mut WebSocketStream<S>,
     driver: &DriverHandle,
+    book: &ChipBook,
     p: &SessionParams,
 ) -> SessionEnd
 where
@@ -323,6 +367,11 @@ where
     let mut last_rx = Instant::now();
     // Only rely on silence detection once the server is known to answer Ping frames.
     let mut server_pongs = false;
+    // UIA runs on the driver thread; results come back here so the loop never waits on
+    // it (it used to await list_chips / act inline, blocking not_found, pongs and reads).
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<Done>();
+    let mut scanning = false;
+    let mut scan_log = ScanLog::default();
 
     let result: Result<(), WsError> = async {
         loop {
@@ -340,19 +389,13 @@ where
                                 Step::Nothing => {}
                                 Step::Reply(m) => send(ws, &m).await?,
                                 Step::Act { request_id, task_id, title, tldr, action } => {
-                                    let tldr = (!tldr.is_empty()).then_some(tldr);
-                                    let r = driver.act(title, tldr, action, p.raise_wait).await;
-                                    match &r {
-                                        Ok(()) => tracing::info!("action {action:?} {task_id} ok"),
-                                        Err(e) => tracing::warn!("action {action:?} {task_id} failed: {e}"),
-                                    }
-                                    let m = ClientMsg::ActionResult {
-                                        request_id,
-                                        task_id,
-                                        ok: r.is_ok(),
-                                        error: r.err().map(|e| e.code().to_string()),
-                                    };
-                                    send(ws, &m).await?;
+                                    let (title, tldr, session) = action_target(book, &task_id, title, tldr);
+                                    book.mark_acting(&task_id);
+                                    let (d, tx, raise_wait) = (driver.clone(), done_tx.clone(), p.raise_wait);
+                                    tokio::spawn(async move {
+                                        let result = d.act(title, tldr, session, action, raise_wait).await;
+                                        let _ = tx.send(Done::Act { request_id, task_id, action, result });
+                                    });
                                 }
                             }
                         }
@@ -369,7 +412,50 @@ where
                         _ => {}
                     }
                 }
-                _ = scan.tick() => locate_scan(ws, &mut loc, driver).await?,
+                _ = scan.tick() => {
+                    for m in loc.expire(Instant::now()) {
+                        send(ws, &m).await?;
+                    }
+                    // Read-only: never move the window here. A chip appears while the user
+                    // is at the PC, so raising Claude would steal the screen. If the window
+                    // is covered the chip is simply not found and the phone gets
+                    // located=false; the raise happens only for an action from the phone.
+                    if !loc.is_empty() && !scanning {
+                        scanning = true;
+                        let (d, tx) = (driver.clone(), done_tx.clone());
+                        tokio::spawn(async move {
+                            let _ = tx.send(Done::Scan(d.list_chips().await));
+                        });
+                    }
+                }
+                Some(done) = done_rx.recv() => match done {
+                    Done::Scan(r) => {
+                        scanning = false;
+                        if !loc.is_empty() {
+                            scan_log.note(&r, &loc.task_ids());
+                        }
+                        let chips = r.unwrap_or_default();
+                        for m in loc.resolve(&chips, Instant::now()) {
+                            send(ws, &m).await?;
+                        }
+                    }
+                    Done::Act { request_id, task_id, action, result } => {
+                        match &result {
+                            Ok(()) => tracing::info!("action {action:?} {task_id} ok"),
+                            Err(e) => {
+                                book.unmark_acting(&task_id);
+                                tracing::warn!("action {action:?} {task_id} failed: {e}");
+                            }
+                        }
+                        let m = ClientMsg::ActionResult {
+                            request_id,
+                            task_id,
+                            ok: result.is_ok(),
+                            error: result.err().map(|e| e.code().to_string()),
+                        };
+                        send(ws, &m).await?;
+                    }
+                },
                 _ = keepalive.tick() => {
                     if server_pongs && last_rx.elapsed() > p.dead_after {
                         tracing::warn!("no traffic for {:?}; reconnecting", last_rx.elapsed());
@@ -416,6 +502,8 @@ pub struct AgentEnv {
     pub config_path: PathBuf,
     pub driver: DriverHandle,
     pub status: StatusSink,
+    /// Chips known from the session files (filled by the watcher).
+    pub book: ChipBook,
 }
 
 /// The agent's main loop. Never returns.
@@ -447,7 +535,7 @@ pub async fn run_forever(env: AgentEnv) {
             Ok(mut ws) => {
                 tracing::info!("connected");
                 (env.status)(Status::Connected);
-                run_session(&mut ws, &env.driver, &params).await
+                run_session(&mut ws, &env.driver, &env.book, &params).await
             }
             Err(e) => {
                 tracing::warn!("connect failed: {e}");
@@ -474,7 +562,8 @@ pub async fn run_forever(env: AgentEnv) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::fake::{chip, Fake};
+    use crate::book::BookEntry;
+    use crate::driver::fake::{chip, ActCall, Fake};
     use crate::driver::spawn;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
@@ -728,12 +817,20 @@ mod tests {
         fake: &Fake,
         p: SessionParams,
     ) -> (ServerWs, tokio::task::JoinHandle<SessionEnd>) {
+        start_with_book(fake, p, ChipBook::default()).await
+    }
+
+    async fn start_with_book(
+        fake: &Fake,
+        p: SessionParams,
+        book: ChipBook,
+    ) -> (ServerWs, tokio::task::JoinHandle<SessionEnd>) {
         let srv = server().await;
         let driver = spawn(fake.clone());
         let mut client = connect(&srv.cfg).await.unwrap();
         let (ws, auth) = srv.accepted.await.unwrap();
         assert_eq!(auth.as_deref(), Some("Bearer secret-token"));
-        let task = tokio::spawn(async move { run_session(&mut client, &driver, &p).await });
+        let task = tokio::spawn(async move { run_session(&mut client, &driver, &book, &p).await });
         (ws, task)
     }
 
@@ -800,6 +897,167 @@ mod tests {
         // The chip appearing later does not produce a second report.
         fake.state().chips = vec![chip("T9", "")];
         assert_eq!(next_json(&mut ws, Duration::from_millis(200)).await, None);
+        ws.close(None).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn expire_reports_only_past_deadlines() {
+        let now = Instant::now();
+        let mut loc = Locator::default();
+        loc.add(&wire("a", "A", ""), now, Duration::from_secs(1));
+        loc.add(&wire("b", "B", ""), now, Duration::from_secs(5));
+        assert!(loc.expire(now).is_empty());
+        assert_eq!(
+            loc.expire(now + Duration::from_secs(1)),
+            vec![ClientMsg::ChipNotFound {
+                task_id: "a".into()
+            }]
+        );
+        assert_eq!(loc.task_ids(), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn action_target_prefers_the_session_file() {
+        let book = ChipBook::default();
+        assert_eq!(
+            action_target(&book, "task_1", "ws title".into(), String::new()),
+            ("ws title".to_string(), None, None)
+        );
+        book.upsert(
+            "task_1",
+            BookEntry {
+                session_title: "Session A".into(),
+                title: "file title".into(),
+                tldr: "file tldr".into(),
+            },
+        );
+        assert_eq!(
+            action_target(&book, "task_1", "ws title".into(), "ws tldr".into()),
+            (
+                "file title".to_string(),
+                Some("file tldr".to_string()),
+                Some("Session A".to_string())
+            )
+        );
+        book.upsert(
+            "task_2",
+            BookEntry {
+                session_title: String::new(),
+                title: String::new(),
+                tldr: String::new(),
+            },
+        );
+        assert_eq!(
+            action_target(&book, "task_2", "ws".into(), "d".into()),
+            ("ws".to_string(), Some("d".to_string()), None)
+        );
+    }
+
+    /// Regression: after `chip.new` nothing was reported for a while. The scan awaited
+    /// UIA inside the WS loop, so a slow list_chips (cold Chromium a11y tree, a big
+    /// sidebar) or a running action held `chip.not_found` (and every other message)
+    /// back until UIA returned. Deadlines are now checked on every tick while UIA runs
+    /// on its own.
+    #[tokio::test]
+    async fn not_found_on_time_even_while_uia_is_slow() {
+        let fake = Fake::default();
+        fake.state().list_delay = Duration::from_secs(3);
+        let (mut ws, task) = start(&fake, fast()).await;
+        let t0 = Instant::now();
+        push(
+            &mut ws,
+            json!({"type":"chip.new","chip":{"task_id":"task_s","title":"TS","status":"located_pending"}}),
+        )
+        .await;
+        assert_eq!(
+            next_json(&mut ws, Duration::from_millis(1500)).await,
+            Some(json!({"type":"chip.not_found","task_id":"task_s"}))
+        );
+        let took = t0.elapsed();
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        // The loop stays responsive while the listing is still running.
+        push(&mut ws, json!({"type":"ping"})).await;
+        assert_eq!(
+            next_json(&mut ws, Duration::from_millis(500)).await,
+            Some(json!({"type":"pong"}))
+        );
+        ws.close(None).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn not_found_and_pong_while_an_action_runs() {
+        let fake = Fake::default();
+        fake.state().act_delay = Duration::from_secs(2);
+        let (mut ws, task) = start(&fake, fast()).await;
+        push(
+            &mut ws,
+            json!({"type":"action","request_id":"r1","task_id":"task_a","action":"start","title":"A"}),
+        )
+        .await;
+        push(
+            &mut ws,
+            json!({"type":"chip.new","chip":{"task_id":"task_b","title":"B","status":"located_pending"}}),
+        )
+        .await;
+        push(&mut ws, json!({"type":"ping"})).await;
+        assert_eq!(expect_json(&mut ws).await, json!({"type":"pong"}));
+        assert_eq!(
+            next_json(&mut ws, Duration::from_millis(1200)).await,
+            Some(json!({"type":"chip.not_found","task_id":"task_b"}))
+        );
+        assert_eq!(
+            expect_json(&mut ws).await,
+            json!({"type":"action.result","request_id":"r1","task_id":"task_a","ok":true,"error":null})
+        );
+        ws.close(None).await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn action_uses_session_file_title_and_marks_acting() {
+        let fake = Fake::default();
+        let book = ChipBook::default();
+        book.upsert(
+            "task_f",
+            BookEntry {
+                session_title: "Session F".into(),
+                title: "exact title".into(),
+                tldr: "exact tldr".into(),
+            },
+        );
+        let (mut ws, task) = start_with_book(&fake, fast(), book.clone()).await;
+        push(
+            &mut ws,
+            json!({"type":"action","request_id":"r1","task_id":"task_f","action":"start","title":"exact  title (ws)","tldr":"x"}),
+        )
+        .await;
+        assert_eq!(expect_json(&mut ws).await["ok"], true);
+        assert_eq!(
+            fake.state().acts[0],
+            ActCall {
+                title: "exact title".into(),
+                tldr: Some("exact tldr".into()),
+                session_title: Some("Session F".into()),
+                action: Action::Start,
+                raise_wait: Duration::from_millis(7)
+            }
+        );
+        assert!(
+            book.take_acting("task_f"),
+            "a successful action keeps the mark (no DELETE)"
+        );
+        // A failed action clears the mark again.
+        fake.state().act_result = Some(ActionError::ChipNotFound);
+        push(
+            &mut ws,
+            json!({"type":"action","request_id":"r2","task_id":"task_f","action":"dismiss"}),
+        )
+        .await;
+        assert_eq!(expect_json(&mut ws).await["ok"], false);
+        assert!(!book.take_acting("task_f"));
         ws.close(None).await.unwrap();
         task.await.unwrap();
     }
@@ -873,15 +1131,16 @@ mod tests {
             assert_eq!(s.acts.len(), 3);
             assert_eq!(
                 s.acts[0],
-                (
-                    "T7".to_string(),
-                    Some("d7".to_string()),
-                    Action::Start,
-                    Duration::from_millis(7)
-                )
+                ActCall {
+                    title: "T7".into(),
+                    tldr: Some("d7".into()),
+                    session_title: None,
+                    action: Action::Start,
+                    raise_wait: Duration::from_millis(7)
+                }
             );
-            assert_eq!(s.acts[1].1, None, "empty tldr is passed as None");
-            assert_eq!(s.acts[1].2, Action::Dismiss);
+            assert_eq!(s.acts[1].tldr, None, "empty tldr is passed as None");
+            assert_eq!(s.acts[1].action, Action::Dismiss);
         }
         ws.close(None).await.unwrap();
         task.await.unwrap();
@@ -976,6 +1235,7 @@ mod tests {
             status: Arc::new(move |s| {
                 let _ = st_tx.send(s);
             }),
+            book: ChipBook::default(),
         };
         let agent = tokio::spawn(run_forever(env));
         let (mut ws, auth) = srv.accepted.await.unwrap();
@@ -1007,6 +1267,7 @@ mod tests {
             status: Arc::new(move |s| {
                 let _ = st_tx.send(s);
             }),
+            book: ChipBook::default(),
         };
         let t0 = Instant::now();
         let agent = tokio::spawn(run_forever(env));

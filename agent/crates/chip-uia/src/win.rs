@@ -22,10 +22,10 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationCondition, IUIAutomationElement,
-    IUIAutomationInvokePattern, IUIAutomationTreeWalker, TreeScope, TreeScope_Children,
-    TreeScope_Descendants, UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
-    UIA_GroupControlTypeId, UIA_InvokePatternId, UIA_StatusBarControlTypeId, UIA_TextControlTypeId,
-    UIA_CONTROLTYPE_ID,
+    IUIAutomationInvokePattern, IUIAutomationScrollItemPattern, IUIAutomationTreeWalker, TreeScope,
+    TreeScope_Children, TreeScope_Descendants, UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
+    UIA_GroupControlTypeId, UIA_ImageControlTypeId, UIA_InvokePatternId, UIA_ScrollItemPatternId,
+    UIA_StatusBarControlTypeId, UIA_TextControlTypeId, UIA_CONTROLTYPE_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindow, GetWindowRect, GetWindowTextW,
@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::logic::{self, Child, Kind, PagerState, SiblingStep};
-use crate::{Action, ActionError, ChipInfo, Labels, WindowInfo};
+use crate::{Action, ActionError, ChipInfo, Labels, SidebarSession, WindowInfo};
 
 /// Chromium's lazy a11y tree: after this long without a query, the first FindAll
 /// returns only the title bar; ask again after WARMUP_DELAY.
@@ -53,6 +53,14 @@ const PAGE_SETTLE: Duration = Duration::from_secs(2);
 const PAGE_POLL: Duration = Duration::from_millis(150);
 /// Safety cap for the sibling walk (the real chip has < 10 siblings).
 const MAX_SIBLINGS: usize = 64;
+/// After a session was opened from the sidebar and its pane header appeared, how long
+/// to wait for the requested chip to render.
+const SESSION_CHIP_WAIT: Duration = Duration::from_secs(3);
+/// After ScrollIntoView on an offscreen sidebar entry, let the list settle.
+const SCROLL_SETTLE: Duration = Duration::from_millis(300);
+/// Title-bar button shown instead of "サイドバーを非表示" while the sidebar is collapsed
+/// (only used to explain a not-found in [`Uia::last_detail`]).
+const SIDEBAR_SHOW: &str = "サイドバーを表示";
 
 fn fail(what: &str) -> impl FnOnce(windows::core::Error) -> ActionError + '_ {
     move |e| ActionError::InvokeFailed(format!("{what}: {}", e.message()))
@@ -82,6 +90,13 @@ fn infos(chips: &[LiveChip]) -> Vec<ChipInfo> {
     chips.iter().map(|c| c.info.clone()).collect()
 }
 
+/// A sidebar session entry plus its live Button element (needed to open it).
+struct LiveEntry {
+    name: String,
+    status: String,
+    element: IUIAutomationElement,
+}
+
 pub struct Uia {
     automation: IUIAutomation,
     walker: IUIAutomationTreeWalker,
@@ -92,6 +107,8 @@ pub struct Uia {
     labels: Labels,
     /// hwnd -> last time its tree was queried (lazy a11y warm-up).
     last_query: RefCell<HashMap<isize, Instant>>,
+    /// Why the last `act` returned ChipNotFound (ActionError carries no detail).
+    last_detail: RefCell<Option<String>>,
     _com: ComGuard,
 }
 
@@ -135,6 +152,7 @@ impl Uia {
             cond_true,
             labels,
             last_query: RefCell::new(HashMap::new()),
+            last_detail: RefCell::new(None),
             _com: com,
         })
     }
@@ -152,18 +170,39 @@ impl Uia {
 
     /// Read-only: never moves/raises any window. Handles the lazy-a11y warm-up.
     pub fn list_chips(&self) -> Result<Vec<ChipInfo>, ActionError> {
-        let (hwnd, win) = self.window()?;
-        let key = hwnd.0 as isize;
-        let last = self.last_query.borrow().get(&key).copied();
-        let cold = logic::is_cold(last, Instant::now(), WARMUP_IDLE);
-        let mut chips = self.read_chips(&win)?;
-        if chips.is_empty() && cold {
-            // The first query only wakes Chromium's a11y tree up; ask again.
-            sleep(WARMUP_DELAY);
-            chips = self.read_chips(&win)?;
-        }
-        self.touch(key);
-        Ok(infos(&chips))
+        self.read_warm(|win| self.read_chips(win))
+            .map(|chips| infos(&chips))
+    }
+
+    /// Read-only: titles of the sessions whose chat pane is shown (primary pane and
+    /// split view), left to right as in the tree, from the "<title>、セッション名を変更"
+    /// header buttons. For logs.
+    pub fn shown_sessions(&self) -> Result<Vec<String>, ActionError> {
+        self.read_warm(|win| self.read_shown(win))
+    }
+
+    /// Read-only: the session entries of the sidebar, top to bottom (diagnostics).
+    /// Entries under collapsed groups are not in the tree.
+    pub fn sidebar_sessions(&self) -> Result<Vec<SidebarSession>, ActionError> {
+        let entries = self.read_warm(|win| self.read_sidebar(win))?;
+        Ok(entries
+            .into_iter()
+            .map(|e| SidebarSession {
+                title: logic::sidebar_session_title(&e.name, Some(&e.status)).map(String::from),
+                offscreen: unsafe { e.element.CurrentIsOffscreen() }
+                    .map(|b| b.as_bool())
+                    .unwrap_or(false),
+                name: e.name,
+                status: e.status,
+            })
+            .collect())
+    }
+
+    /// Why the last [`Uia::act`] returned [`ActionError::ChipNotFound`] (e.g. "session
+    /// \"x\" is not in the sidebar"); None after any other outcome. For logs, until
+    /// ActionError::ChipNotFound can carry a detail itself.
+    pub fn last_detail(&self) -> Option<String> {
+        self.last_detail.borrow().clone()
     }
 
     /// Un-occlude, wait until any chip renders (<= raise_wait), then list. No paging,
@@ -176,22 +215,42 @@ impl Uia {
 
     /// Un-occlude → wait for any chip (<= raise_wait) → wait for `title` (<= 1.5 s) →
     /// page with "next" if needed → press start/dismiss → restore the window state.
+    ///
+    /// When the chip is in no shown pane and `session_title` (the chip's session, from
+    /// Claude desktop's session file) is given and not shown either: invoke that
+    /// session's sidebar entry, which opens it in the primary pane (replacing what was
+    /// shown there), wait for its pane header (<= raise_wait) and the chip (<= 3 s),
+    /// page, press. On ChipNotFound, [`Uia::last_detail`] says why.
     pub fn act(
         &self,
         title: &str,
         tldr: Option<&str>,
+        session_title: Option<&str>,
         action: Action,
         raise_wait: Duration,
     ) -> Result<(), ActionError> {
+        self.last_detail.replace(None);
         let (hwnd, win) = self.window()?;
         // The window is usually covered while the user is away, so Chromium has not
         // rendered the chip; keep it un-occluded for find + invoke (restored on drop).
         let _raised = RaiseGuard::raise(hwnd);
         self.wait_chips(&win, hwnd, None, raise_wait);
         self.wait_chips(&win, hwnd, Some((title, tldr)), TITLE_WAIT);
-        let hit = self
-            .find_paged(&win, title, tldr)?
-            .ok_or(ActionError::ChipNotFound)?;
+        let hit = match self.find_paged(&win, title, tldr)? {
+            Some(hit) => hit,
+            None => {
+                let Some(session) = session_title.filter(|s| !s.is_empty()) else {
+                    return Err(self.not_found("chip is not in any shown pane".into()));
+                };
+                self.open_session(&win, hwnd, session, raise_wait)?;
+                self.wait_chips(&win, hwnd, Some((title, tldr)), SESSION_CHIP_WAIT);
+                self.find_paged(&win, title, tldr)?.ok_or_else(|| {
+                    self.not_found(format!(
+                        "opened session {session:?} from the sidebar but the chip is not in it"
+                    ))
+                })?
+            }
+        };
         let label = match action {
             Action::Start => &self.labels.start,
             Action::Dismiss => &self.labels.dismiss,
@@ -211,6 +270,148 @@ impl Uia {
 
     fn touch(&self, key: isize) {
         self.last_query.borrow_mut().insert(key, Instant::now());
+    }
+
+    /// Read-only read with the lazy-a11y warm-up: when the window is cold and the first
+    /// read comes back empty, wait and read once more.
+    fn read_warm<T>(
+        &self,
+        read: impl Fn(&IUIAutomationElement) -> Result<Vec<T>, ActionError>,
+    ) -> Result<Vec<T>, ActionError> {
+        let (hwnd, win) = self.window()?;
+        let key = hwnd.0 as isize;
+        let last = self.last_query.borrow().get(&key).copied();
+        let cold = logic::is_cold(last, Instant::now(), WARMUP_IDLE);
+        let mut out = read(&win)?;
+        if out.is_empty() && cold {
+            // The first query only wakes Chromium's a11y tree up; ask again.
+            sleep(WARMUP_DELAY);
+            out = read(&win)?;
+        }
+        self.touch(key);
+        Ok(out)
+    }
+
+    /// Records the reason for `last_detail` and returns ChipNotFound.
+    fn not_found(&self, detail: String) -> ActionError {
+        self.last_detail.replace(Some(detail));
+        ActionError::ChipNotFound
+    }
+
+    /// Opens `session` in the primary pane by invoking its sidebar entry, then waits
+    /// (<= wait) until its pane header shows up. Errors are ChipNotFound with a detail.
+    fn open_session(
+        &self,
+        win: &IUIAutomationElement,
+        hwnd: HWND,
+        session: &str,
+        wait: Duration,
+    ) -> Result<(), ActionError> {
+        let is_shown = |shown: &[String]| shown.iter().any(|t| logic::same_session(t, session));
+        if is_shown(&self.read_shown(win)?) {
+            return Err(self.not_found(format!(
+                "session {session:?} is shown but the chip is not in it"
+            )));
+        }
+        let entries = self.read_sidebar(win)?;
+        let pairs: Vec<(String, Option<String>)> = entries
+            .iter()
+            .map(|e| (e.name.clone(), Some(e.status.clone())))
+            .collect();
+        let Some(i) = logic::pick_sidebar(&pairs, session) else {
+            let collapsed = self.has_button(win, SIDEBAR_SHOW);
+            return Err(self.not_found(format!(
+                "session {session:?} is not in the sidebar{}",
+                if collapsed {
+                    " (the sidebar is collapsed)"
+                } else {
+                    " (scrolled away, under a collapsed group, or archived)"
+                }
+            )));
+        };
+        let entry = &entries[i].element;
+        if unsafe { entry.CurrentIsOffscreen() }.is_ok_and(|b| b.as_bool()) {
+            // Best effort: Chromium usually invokes offscreen elements anyway.
+            if let Ok(p) = unsafe {
+                entry.GetCurrentPatternAs::<IUIAutomationScrollItemPattern>(UIA_ScrollItemPatternId)
+            } {
+                if unsafe { p.ScrollIntoView() }.is_ok() {
+                    sleep(SCROLL_SETTLE);
+                }
+            }
+        }
+        self.invoke(entry)?;
+        let deadline = Instant::now() + wait;
+        loop {
+            let shown = self.read_shown(win).unwrap_or_default();
+            self.touch(hwnd.0 as isize);
+            if is_shown(&shown) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(self.not_found(format!(
+                    "invoked the sidebar entry {:?} but no pane header for {session:?} appeared \
+                     (shown: {shown:?})",
+                    entries[i].name
+                )));
+            }
+            sleep(POLL);
+        }
+    }
+
+    fn buttons(
+        &self,
+        win: &IUIAutomationElement,
+    ) -> Result<Vec<IUIAutomationElement>, ActionError> {
+        self.find_all(win, TreeScope_Descendants, &self.cond_button)
+            .map_err(fail("FindAll(Button)"))
+    }
+
+    fn has_button(&self, win: &IUIAutomationElement, label: &str) -> bool {
+        self.buttons(win)
+            .unwrap_or_default()
+            .iter()
+            .any(|b| name(b) == label)
+    }
+
+    /// Titles of the shown panes, from their "<title>、セッション名を変更" headers.
+    fn read_shown(&self, win: &IUIAutomationElement) -> Result<Vec<String>, ActionError> {
+        Ok(self
+            .buttons(win)?
+            .iter()
+            .filter_map(|b| logic::header_session_title(&name(b)).map(String::from))
+            .collect())
+    }
+
+    /// Sidebar session entries: Buttons whose children are [StatusBar|Image, Group].
+    fn read_sidebar(&self, win: &IUIAutomationElement) -> Result<Vec<LiveEntry>, ActionError> {
+        let mut out = Vec::new();
+        for b in self.buttons(win)? {
+            let n = name(&b);
+            // "<status> <title>" always has a space; skip the rest without reading
+            // their children (a pane has ~50 buttons).
+            if !n.contains(' ') {
+                continue;
+            }
+            let Ok(kids) = self.find_all(&b, TreeScope_Children, &self.cond_true) else {
+                continue;
+            };
+            let nodes: Vec<Child> = kids
+                .iter()
+                .map(|k| Child {
+                    kind: kind(k),
+                    name: name(k),
+                })
+                .collect();
+            if let Some(status) = logic::sidebar_status(&nodes) {
+                out.push(LiveEntry {
+                    status: status.to_string(),
+                    name: n,
+                    element: b,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Polls until a chip matching `title` (or any chip when None) is in the tree, or
@@ -375,6 +576,10 @@ impl Uia {
             .into_iter()
             .find(|b| name(b) == label)
             .ok_or(ActionError::ButtonNotFound)?;
+        self.invoke(&btn)
+    }
+
+    fn invoke(&self, btn: &IUIAutomationElement) -> Result<(), ActionError> {
         if !unsafe { btn.CurrentIsEnabled() }
             .map(|b| b.as_bool())
             .unwrap_or(true)
@@ -413,6 +618,7 @@ fn kind(el: &IUIAutomationElement) -> Kind {
         Ok(t) if t == UIA_TextControlTypeId => Kind::Text,
         Ok(t) if t == UIA_GroupControlTypeId => Kind::Group,
         Ok(t) if t == UIA_ButtonControlTypeId => Kind::Button,
+        Ok(t) if t == UIA_ImageControlTypeId => Kind::Image,
         _ => Kind::Other,
     }
 }

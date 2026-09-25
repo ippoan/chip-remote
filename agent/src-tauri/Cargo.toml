@@ -33,6 +33,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros",
 # TLS は native-tls (Windows では SChannel)。rustls の aws-lc-rs のような C ビルドが要らない。
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# POST / DELETE /v1/chips for chips found in the session files. Already in the tree
+# through tauri / the updater; native-tls (SChannel) like the WebSocket.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "local-time"] }
 # 「ログをコピー」。AlcAppTauri と同じく tauri-plugin-clipboard より依存が薄い arboard。

@@ -16,10 +16,11 @@ impl ChipDriver for chip_uia::Uia {
         &self,
         title: &str,
         tldr: Option<&str>,
+        session_title: Option<&str>,
         action: Action,
         raise_wait: Duration,
     ) -> Result<(), ActionError> {
-        chip_uia::Uia::act(self, title, tldr, action, raise_wait)
+        chip_uia::Uia::act(self, title, tldr, session_title, action, raise_wait)
     }
 }
 

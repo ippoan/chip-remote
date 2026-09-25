@@ -48,6 +48,15 @@ pub struct Config {
     pub raise_wait_sec: f64,
     /// Block system sleep while the agent runs (SetThreadExecutionState).
     pub prevent_sleep: bool,
+    /// Report chips found in Claude desktop's session files to the Worker
+    /// (`POST` / `DELETE /v1/chips`), so the hooks are not needed on this PC.
+    pub watch_sessions: bool,
+    /// Where Claude desktop keeps its session files. Empty: the default
+    /// `%APPDATA%\Claude\claude-code-sessions` ([`Config::sessions_dir`]).
+    pub sessions_dir: String,
+    /// `host` of chips reported from the session files (shared with the Windows hook).
+    /// Empty: the machine name.
+    pub host: String,
 }
 
 impl Default for Config {
@@ -61,6 +70,9 @@ impl Default for Config {
             takeover_backoff_sec: 300,
             raise_wait_sec: 5.0,
             prevent_sleep: true,
+            watch_sessions: true,
+            sessions_dir: String::new(),
+            host: String::new(),
         }
     }
 }
@@ -110,6 +122,17 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Directory with Claude desktop's session files: `sessionsDir`, or
+    /// `<appdata>\Claude\claude-code-sessions`.
+    pub fn sessions_dir(&self, appdata: &Path) -> PathBuf {
+        let d = self.sessions_dir.trim();
+        if d.is_empty() {
+            appdata.join("Claude").join("claude-code-sessions")
+        } else {
+            PathBuf::from(d)
+        }
+    }
+
     /// `https://x` → `wss://x/v1/agent/ws`, `http://x` → `ws://x/v1/agent/ws`.
     pub fn ws_url(&self) -> String {
         let base = self.url.trim_end_matches('/');
@@ -135,6 +158,21 @@ mod tests {
         assert_eq!(c.labels, Labels::default());
         assert!(c.prevent_sleep);
         assert_eq!(c.raise_wait_sec, 5.0);
+        assert!(c.watch_sessions);
+        assert_eq!(c.sessions_dir, "");
+        assert_eq!(c.host, "");
+    }
+
+    #[test]
+    fn sessions_dir_default_and_override() {
+        let appdata = Path::new("C:/Users/x/AppData/Roaming");
+        let c = Config::from_json(r#"{"watchSessions":false}"#).unwrap();
+        assert!(!c.watch_sessions);
+        assert!(c
+            .sessions_dir(appdata)
+            .ends_with(Path::new("Claude").join("claude-code-sessions")));
+        let c = Config::from_json(r#"{"sessionsDir":" D:/s "}"#).unwrap();
+        assert_eq!(c.sessions_dir(appdata), PathBuf::from("D:/s"));
     }
 
     #[test]

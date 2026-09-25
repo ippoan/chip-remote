@@ -20,7 +20,7 @@
 //! Group  "チャットメッセージ"         <- end of the chip
 //! ```
 
-use chip_core::{ChipInfo, Labels};
+use chip_core::{normalize, ChipInfo, Labels};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,7 @@ pub enum Kind {
     Text,
     Group,
     Button,
+    Image,
     Other,
 }
 
@@ -183,6 +184,116 @@ pub fn pick_main_window(titles: &[String]) -> Option<usize> {
         .position(|t| t == "Claude")
         .or_else(|| titles.iter().position(|t| !t.is_empty()))
         .or(if titles.is_empty() { None } else { Some(0) })
+}
+
+// ------------------------------------------------------------------ sessions
+//
+// Measured sidebar / pane-header layout (Claude desktop 2.7032, Japanese UI, 2026-09-25):
+//
+// ```text
+// Button "<status> <title>"                <- sidebar session entry; Invoke opens it in
+//   StatusBar|Image "<status>"                the primary pane. status is e.g. "実行中",
+//   Group ''                                  "未読の返答", "アイドル" or a PR prefix
+// Button "<title>のその他のオプション"       "#21, #584 · マージ済み" (then an Image)
+// ...
+// Button "<title>、セッション名を変更"        <- header of each SHOWN chat pane
+// Button "<title>のその他のオプション"
+// ```
+//
+// The account button ("<name> <name> Max": Image + Text + Text) and the chat-pane task
+// buttons ("実行中 <agent task>", no children) must not be taken for sessions: an entry
+// needs exactly the [StatusBar|Image, Group] child structure.
+
+/// Suffix of a shown pane's header button: "<title>、セッション名を変更".
+pub const RENAME_SUFFIX: &str = "、セッション名を変更";
+/// Suffix of the per-session menu buttons (sidebar and header), never the one to press.
+pub const MORE_OPTIONS_SUFFIX: &str = "のその他のオプション";
+
+/// Session title of a pane header button, or None when `name` is not a header.
+pub fn header_session_title(name: &str) -> Option<&str> {
+    name.strip_suffix(RENAME_SUFFIX).filter(|t| !t.is_empty())
+}
+
+/// The status text of a sidebar session entry, whose children are exactly
+/// [StatusBar|Image "<status>", Group] (measured). None for any other button.
+pub fn sidebar_status(children: &[Child]) -> Option<&str> {
+    match children {
+        [s, g]
+            if matches!(s.kind, Kind::StatusBar | Kind::Image)
+                && !s.name.is_empty()
+                && g.kind == Kind::Group =>
+        {
+            Some(&s.name)
+        }
+        _ => None,
+    }
+}
+
+/// Session title of a sidebar entry named "<status> <title>". None when there is no
+/// status or the name does not start with "<status> ".
+pub fn sidebar_session_title<'a>(name: &'a str, status: Option<&str>) -> Option<&'a str> {
+    let status = status.filter(|s| !s.is_empty())?;
+    name.strip_prefix(status)?
+        .strip_prefix(' ')
+        .filter(|t| !t.is_empty())
+}
+
+/// How well a sidebar entry matches the wanted session title (higher is better).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SidebarMatch {
+    /// The name ends with " " + title, but the status prefix does not split it off as
+    /// exactly that title.
+    Suffix,
+    /// The title split off the name equals the wanted one after whitespace
+    /// normalization (the session file and the UI may differ in spacing).
+    Normalized,
+    /// The name is exactly "<status> <title>" (or exactly the title).
+    Exact,
+}
+
+/// Does the sidebar button `name` (with `status` from [`sidebar_status`]) open the
+/// session titled `title`? The "…のその他のオプション" menu buttons never match.
+pub fn match_sidebar(name: &str, status: Option<&str>, title: &str) -> Option<SidebarMatch> {
+    if title.is_empty() || name.is_empty() {
+        return None;
+    }
+    if name.ends_with(MORE_OPTIONS_SUFFIX) && !title.ends_with(MORE_OPTIONS_SUFFIX) {
+        return None;
+    }
+    if name == title {
+        return Some(SidebarMatch::Exact);
+    }
+    if let Some(t) = sidebar_session_title(name, status) {
+        if t == title {
+            return Some(SidebarMatch::Exact);
+        }
+        if normalize(t) == normalize(title) {
+            return Some(SidebarMatch::Normalized);
+        }
+    }
+    if normalize(name).ends_with(&format!(" {}", normalize(title))) {
+        return Some(SidebarMatch::Suffix);
+    }
+    None
+}
+
+/// Index of the best sidebar entry for `title` among (name, status) pairs: the highest
+/// [`SidebarMatch`]; on a tie the first one (top of the sidebar = most recent).
+pub fn pick_sidebar(entries: &[(String, Option<String>)], title: &str) -> Option<usize> {
+    let mut best: Option<(SidebarMatch, usize)> = None;
+    for (i, (name, status)) in entries.iter().enumerate() {
+        if let Some(m) = match_sidebar(name, status.as_deref(), title) {
+            if best.is_none_or(|(b, _)| m > b) {
+                best = Some((m, i));
+            }
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+/// Is the pane-header title `shown` the session `title` (exact or whitespace-normalized)?
+pub fn same_session(shown: &str, title: &str) -> bool {
+    shown == title || normalize(shown) == normalize(title)
 }
 
 #[cfg(test)]
@@ -371,5 +482,189 @@ mod tests {
         assert_eq!(pick_main_window(&t(&["", "Other"])), Some(1));
         assert_eq!(pick_main_window(&t(&["", ""])), Some(0));
         assert_eq!(pick_main_window(&[]), None);
+    }
+
+    fn entry_kids(status_kind: Kind, status: &str) -> Vec<Child> {
+        vec![Child::new(status_kind, status), Child::new(Kind::Group, "")]
+    }
+
+    #[test]
+    fn header_title_is_the_rename_button_prefix() {
+        assert_eq!(
+            header_session_title("#p1133 訴訟用の準備ページの監督、セッション名を変更"),
+            Some("#p1133 訴訟用の準備ページの監督")
+        );
+        assert_eq!(
+            header_session_title("Claude Desktop Android 拡張、セッション名を変更"),
+            Some("Claude Desktop Android 拡張")
+        );
+        assert_eq!(header_session_title("、セッション名を変更"), None);
+        assert_eq!(
+            header_session_title("Claude Desktop Android 拡張のその他のオプション"),
+            None
+        );
+        assert_eq!(header_session_title("分割ビューを閉じる"), None);
+    }
+
+    #[test]
+    fn sidebar_status_needs_measured_structure() {
+        assert_eq!(
+            sidebar_status(&entry_kids(Kind::StatusBar, "実行中")),
+            Some("実行中")
+        );
+        assert_eq!(
+            sidebar_status(&entry_kids(Kind::Image, "#21, #584 · マージ済み")),
+            Some("#21, #584 · マージ済み")
+        );
+        // Account button: Image + Text + Text.
+        let account = [
+            Child::new(Kind::Image, "user"),
+            Child::new(Kind::Text, "user"),
+            Child::new(Kind::Text, "Max"),
+        ];
+        assert_eq!(sidebar_status(&account), None);
+        // Chat-pane task buttons and menu buttons have no children.
+        assert_eq!(sidebar_status(&[]), None);
+        assert_eq!(sidebar_status(&entry_kids(Kind::StatusBar, "")), None);
+        assert_eq!(sidebar_status(&entry_kids(Kind::Text, "実行中")), None);
+        let mut three = entry_kids(Kind::StatusBar, "実行中");
+        three.push(Child::new(Kind::Group, ""));
+        assert_eq!(sidebar_status(&three), None);
+    }
+
+    #[test]
+    fn sidebar_title_strips_status_and_pr_prefixes() {
+        let cases = [
+            (
+                "実行中 Claude Desktop Android 拡張",
+                "実行中",
+                "Claude Desktop Android 拡張",
+            ),
+            (
+                "入力待ち #p1133 訴訟用の準備ページの監督",
+                "入力待ち",
+                "#p1133 訴訟用の準備ページの監督",
+            ),
+            ("アイドル 仕入れ対応", "アイドル", "仕入れ対応"),
+            (
+                "未読の返答 chip-remote prod probe 2",
+                "未読の返答",
+                "chip-remote prod probe 2",
+            ),
+            (
+                "#21, #584 · マージ済み #p20 指静脈の配線の監督",
+                "#21, #584 · マージ済み",
+                "#p20 指静脈の配線の監督",
+            ),
+            (
+                "#273 · マージ済み [O] VoiceS3R で FC-1200 を RS232 (G7/G8) につなぐ",
+                "#273 · マージ済み",
+                "[O] VoiceS3R で FC-1200 を RS232 (G7/G8) につなぐ",
+            ),
+        ];
+        for (name, status, want) in cases {
+            assert_eq!(
+                sidebar_session_title(name, Some(status)),
+                Some(want),
+                "{name}"
+            );
+        }
+        assert_eq!(sidebar_session_title("実行中 x", None), None);
+        assert_eq!(sidebar_session_title("実行中 x", Some("")), None);
+        assert_eq!(sidebar_session_title("実行中x", Some("実行中")), None);
+        assert_eq!(sidebar_session_title("実行中 ", Some("実行中")), None);
+        assert_eq!(sidebar_session_title("アイドル x", Some("実行中")), None);
+    }
+
+    #[test]
+    fn match_sidebar_ranks_exact_over_suffix() {
+        let t = "Claude Desktop Android 拡張";
+        let name = "実行中 Claude Desktop Android 拡張";
+        assert_eq!(
+            match_sidebar(name, Some("実行中"), t),
+            Some(SidebarMatch::Exact)
+        );
+        // Status unknown: only the suffix rule applies.
+        assert_eq!(match_sidebar(name, None, t), Some(SidebarMatch::Suffix));
+        // A title that is a word-suffix of another title (titles contain spaces) is
+        // only a suffix match, never exact.
+        assert_eq!(
+            match_sidebar(name, Some("実行中"), "Android 拡張"),
+            Some(SidebarMatch::Suffix)
+        );
+        // Not at a word boundary.
+        assert_eq!(match_sidebar(name, Some("実行中"), "張"), None);
+        assert_eq!(match_sidebar(name, Some("実行中"), "id 拡張"), None);
+        // PR prefix.
+        assert_eq!(
+            match_sidebar(
+                "#21, #584 · マージ済み #p20 指静脈の配線の監督",
+                Some("#21, #584 · マージ済み"),
+                "#p20 指静脈の配線の監督"
+            ),
+            Some(SidebarMatch::Exact)
+        );
+        // Exact name (no prefix at all).
+        assert_eq!(match_sidebar(t, None, t), Some(SidebarMatch::Exact));
+        // Spacing differs between the session file and the UI.
+        assert_eq!(
+            match_sidebar(
+                "アイドル 本社ネット接続 syslog確認",
+                Some("アイドル"),
+                "本社ネット接続  syslog確認"
+            ),
+            Some(SidebarMatch::Normalized)
+        );
+        assert_eq!(match_sidebar("", None, t), None);
+        assert_eq!(match_sidebar(name, None, ""), None);
+    }
+
+    #[test]
+    fn match_sidebar_ignores_more_options_buttons() {
+        assert_eq!(
+            match_sidebar("仕入れ対応のその他のオプション", None, "仕入れ対応"),
+            None
+        );
+        assert_eq!(
+            match_sidebar("x 仕入れ対応のその他のオプション", None, "x 仕入れ対応"),
+            None
+        );
+        // Only a title that itself ends with the suffix could match such a name.
+        assert_eq!(
+            match_sidebar(
+                "アイドル aのその他のオプション",
+                Some("アイドル"),
+                "aのその他のオプション"
+            ),
+            Some(SidebarMatch::Exact)
+        );
+    }
+
+    #[test]
+    fn pick_sidebar_prefers_exact_then_first() {
+        let e = |v: &[(&str, Option<&str>)]| {
+            v.iter()
+                .map(|(n, s)| (n.to_string(), s.map(str::to_string)))
+                .collect::<Vec<_>>()
+        };
+        let entries = e(&[
+            ("アイドル x foo bar", Some("アイドル")), // suffix for "foo bar"
+            ("foo barのその他のオプション", None),    // menu: ignored
+            ("入力待ち foo bar", Some("入力待ち")),   // exact
+            ("#1 · マージ済み foo bar", Some("#1 · マージ済み")), // exact, later
+        ]);
+        assert_eq!(pick_sidebar(&entries, "foo bar"), Some(2));
+        assert_eq!(pick_sidebar(&entries, "x foo bar"), Some(0));
+        assert_eq!(pick_sidebar(&entries, "bar"), Some(0));
+        assert_eq!(pick_sidebar(&entries, "nothing"), None);
+        assert_eq!(pick_sidebar(&[], "foo"), None);
+    }
+
+    #[test]
+    fn same_session_normalizes_whitespace() {
+        assert!(same_session("a b", "a b"));
+        assert!(same_session("a  b ", "a b"));
+        assert!(same_session("a\u{3000}b", "a b"));
+        assert!(!same_session("a b", "a bc"));
     }
 }

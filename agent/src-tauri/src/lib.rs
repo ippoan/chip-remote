@@ -1,6 +1,8 @@
 //! chip-remote Windows agent as a Tauri 2 tray app (no window).
 //!
 //! - [`agent`] — Worker WebSocket, locate queue, actions (testable, no Tauri)
+//! - [`watcher`] / [`reporter`] / [`book`] — Claude desktop's session files → chips
+//!   reported to the Worker over HTTP (no hook needed on this PC)
 //! - [`driver`] — UIA behind a trait, served by one dedicated thread
 //! - [`uia`] — the real driver (`chip_uia::Uia`)
 //! - [`logging`] — agent.log (1 MB rotation) + ring buffer for 「ログをコピー」
@@ -8,11 +10,14 @@
 //! - this file — tray menu, plugins (single instance, autostart, opener, updater)
 
 pub mod agent;
+pub mod book;
 pub mod driver;
 pub mod logging;
 pub mod paths;
+pub mod reporter;
 pub mod status;
 pub mod uia;
+pub mod watcher;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -248,10 +253,19 @@ pub fn run() {
             let status = build_tray(app, ring.clone(), config_path.clone(), local_dir.clone())?;
 
             let driver = driver::spawn(uia::UiaFactory);
+            let book = book::ChipBook::default();
             tauri::async_runtime::spawn(agent::run_forever(agent::AgentEnv {
                 config_path: config_path.clone(),
                 driver,
                 status,
+                book: book.clone(),
+            }));
+            tauri::async_runtime::spawn(watcher::run_forever(watcher::WatchEnv {
+                config_path: config_path.clone(),
+                appdata: paths::appdata_dir(),
+                book,
+                poll: watcher::POLL_INTERVAL,
+                retry: reporter::RetryPolicy::default(),
             }));
             if has_updater {
                 tauri::async_runtime::spawn(update_loop(app.handle().clone()));

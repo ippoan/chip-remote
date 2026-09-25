@@ -170,11 +170,14 @@ export class HubDO extends DurableObject<Env> {
     return { created: true, chip: toChip(row) };
   }
 
-  /** DELETE /v1/chips/:task_id。未知なら null。withdrawn 済みなら何も送らず返す。 */
+  /**
+   * DELETE /v1/chips/:task_id。未知なら null。withdrawn / done 済みなら何も送らず返す
+   * (done = phone の action で完了済み。ここで chip_cancel を送ると phone の結果通知が消える)。
+   */
   async withdrawChip(taskId: string): Promise<Chip | null> {
     const row = this.row(taskId);
     if (!row) return null;
-    if (row.status === "withdrawn") return toChip(row);
+    if (row.status === "withdrawn" || row.status === "done") return toChip(row);
 
     this.update(taskId, { status: "withdrawn", deadline_at: null, deadline_kind: null });
     this.rescheduleAlarm();
