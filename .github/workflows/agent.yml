@@ -1,0 +1,158 @@
+name: agent
+
+# Rust / Tauri Windows agent (agent/). Build + test on every PR; on main also publish the
+# NSIS installer to the `agent-latest` prerelease (the updater endpoint reads
+# agent-latest/latest.json, uploaded only when the build was signed).
+
+on:
+  pull_request:
+    paths:
+      - 'agent/**'
+      - '.github/workflows/agent.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'agent/**'
+      - '.github/workflows/agent.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-${{ github.event.pull_request.number || github.ref }}
+  # main の publish を途中で止めない
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # agent-latest release (main push only)
+    defaults:
+      run:
+        working-directory: agent
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "agent -> target"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install npm deps (tauri CLI)
+        run: npm install --no-package-lock --no-audit --no-fund
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # UIA tests only create COM objects (no window is touched); the agent's WS tests use
+      # an in-process server and a fake UIA driver.
+      - name: Test
+        run: cargo test --workspace
+
+      # tauri-plugin-updater compares the installed version with latest.json, so every
+      # build gets a unique semver: 0.0.<run_number> (git keeps "0.1.0").
+      - name: Patch tauri.conf.json version
+        id: version
+        run: |
+          set -euo pipefail
+          V="0.0.${GITHUB_RUN_NUMBER}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          node -e "const f='src-tauri/tauri.conf.json';const j=JSON.parse(require('fs').readFileSync(f,'utf8'));j.version='${V}';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n');"
+          echo "version -> $V"
+
+      # Updater artifacts (.sig) need the signing key. Without it build the installer
+      # only (createUpdaterArtifacts=false). plugins.updater stays in the config: the
+      # updater plugin refuses to start without its config section.
+      - name: Build NSIS installer (signed if the key is present)
+        id: bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.CHIP_REMOTE_TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.CHIP_REMOTE_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::warning::CHIP_REMOTE_TAURI_SIGNING_PRIVATE_KEY is not set; building without updater artifacts (no auto-update for this build)"
+            node -e "const f='src-tauri/tauri.conf.json';const j=JSON.parse(require('fs').readFileSync(f,'utf8'));j.bundle.createUpdaterArtifacts=false;require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n');"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          else
+            if grep -q 'REPLACE_WITH_TAURI_SIGNER_PUBKEY' src-tauri/tauri.conf.json; then
+              echo "::warning::plugins.updater.pubkey is still the placeholder; installed agents cannot verify updates"
+            fi
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          fi
+          npm run build
+
+      - name: Collect installer
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          exe=$(ls target/release/bundle/nsis/*-setup.exe | head -1)
+          # Stable asset name so the README / latest.json URL never changes.
+          cp "$exe" out/chip-remote-agent_x64-setup.exe
+          if [ -f "$exe.sig" ]; then cp "$exe.sig" out/chip-remote-agent_x64-setup.exe.sig; fi
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chip-remote-agent-nsis
+          path: |
+            agent/out/*.exe
+            agent/out/*.exe.sig
+          if-no-files-found: error
+
+      - name: Build latest.json (signed builds only)
+        if: steps.bundle.outputs.signed == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          node -e "
+            const fs = require('fs');
+            const url = 'https://github.com/' + process.env.GITHUB_REPOSITORY + '/releases/download/agent-latest/chip-remote-agent_x64-setup.exe';
+            const j = {
+              version: process.env.VERSION,
+              notes: 'chip-remote-agent main ' + process.env.GITHUB_SHA.slice(0, 7) + ' / run ' + process.env.GITHUB_RUN_NUMBER,
+              pub_date: new Date().toISOString(),
+              platforms: { 'windows-x86_64': { signature: fs.readFileSync('out/chip-remote-agent_x64-setup.exe.sig', 'utf8').trim(), url } },
+            };
+            fs.writeFileSync('out/latest.json', JSON.stringify(j, null, 2) + '\n');
+          "
+          cat out/latest.json
+
+      - name: Publish agent-latest release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED: ${{ steps.bundle.outputs.signed }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          kind=$([ "$SIGNED" = "true" ] && echo "signed (auto-update)" || echo "unsigned (no auto-update)")
+          # Re-point the tag at this commit: recreate the release.
+          gh release delete agent-latest --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/agent-latest" >/dev/null 2>&1 || true
+          gh release create agent-latest out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Windows agent (latest)" \
+            --notes "chip-remote-agent ${VERSION} / main ${GITHUB_SHA::7} / run ${GITHUB_RUN_NUMBER} / ${kind}" \
+            --prerelease

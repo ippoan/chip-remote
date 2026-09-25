@@ -1,0 +1,82 @@
+//! Lists the chips chip-uia sees in Claude desktop.
+//!
+//!   cargo run -p chip-uia --example probe            read-only (never moves a window)
+//!   cargo run -p chip-uia --example probe -- --raise un-occlude Claude first (moves z-order)
+//!
+//! Labels / raiseWaitSec come from %APPDATA%\chip-remote\config.json when present
+//! (url / token are not required here), else the built-in defaults.
+
+use chip_core::Config;
+use chip_uia::Uia;
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+fn load_config() -> Config {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return Config::default();
+    };
+    let path = Config::default_path(std::path::Path::new(&appdata));
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match Config::from_json(&text) {
+            Ok(c) => {
+                println!("config: {}", path.display());
+                c
+            }
+            Err(e) => {
+                eprintln!("config: {}: {e} (using defaults)", path.display());
+                Config::default()
+            }
+        },
+        Err(_) => Config::default(),
+    }
+}
+
+fn main() -> ExitCode {
+    let raise = std::env::args().skip(1).any(|a| a == "--raise");
+    let cfg = load_config();
+    let uia = match Uia::new(cfg.labels.clone()) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("UIA init failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match uia.window_info() {
+        Ok(w) => println!(
+            "window: \"{}\" hwnd={:#x} minimized={} foreground={}",
+            w.title, w.hwnd, w.minimized, w.foreground
+        ),
+        Err(e) => {
+            println!("Claude desktop is not running (no claude.exe with a main window): {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let t0 = Instant::now();
+    let res = if raise {
+        let wait = Duration::from_secs_f64(cfg.raise_wait_sec.max(0.0));
+        uia.list_chips_raised(wait)
+    } else {
+        uia.list_chips()
+    };
+    let chips = match res {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("list failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "chips: {} ({} ms{})",
+        chips.len(),
+        t0.elapsed().as_millis(),
+        if raise { ", raised" } else { "" }
+    );
+    for (i, c) in chips.iter().enumerate() {
+        println!();
+        println!("[{}] title  : {}", i + 1, c.title);
+        println!("    tldr   : {}", c.tldr);
+        println!("    buttons: {}", c.buttons.join(" | "));
+        println!("    pane_x : {}", c.pane_x);
+    }
+    ExitCode::SUCCESS
+}

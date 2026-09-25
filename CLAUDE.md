@@ -18,7 +18,8 @@ Claude desktop の `spawn_task` chip を Android 通知から起動・非表示�
 |---|---|
 | `src/`, `test/`, `wrangler.toml` | Cloudflare Worker (Hono) + `HubDO` (`idFromName("hub")` の 1 個) |
 | `hooks/` | PostToolUse hook (spawn_task / dismiss_task → Worker) |
-| `windows-agent/` | PowerShell 常駐 agent (UI Automation で chip を操作) |
+| `agent/` | Windows agent (Rust / Tauri 2 トレイ常駐。UI Automation で chip を操作)。NSIS は Release `agent-latest` |
+| `windows-agent/` | 旧 PowerShell agent (`agent/` の実機確認が済んだら削除) |
 | `android/` | Android アプリ (FCM 受信 → 通知 → action POST) |
 
 **契約 (エンドポイント・メッセージ・FCM payload・状態・エラーコード) を変えるときは
