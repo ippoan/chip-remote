@@ -5,7 +5,7 @@ name: CI
 # `wrangler deploy` で同一 worker (chip-remote) に出す。
 #
 # paths-ignore (android/** 等) は付けない: required check が skip されると PR が
-# pending のまま merge できなくなるため。android / windows-agent / hooks の CI は
+# pending のまま merge できなくなるため。android / agent / hooks の CI は
 # 必要になったら別 workflow で足す。
 
 on:

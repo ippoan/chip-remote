@@ -3,7 +3,7 @@
 Claude desktop が動く Windows のログオンセッションに常駐し、Worker と WebSocket
 (`/v1/agent/ws`) でつながって、スマホから押された spawn_task chip のボタン
 (「ワークツリーで開始」/「提案を非表示」) を UI Automation で押す。
-PowerShell 版 (`windows-agent/`) の置き換えで、プロトコル上の振る舞いは同じ
+旧 PowerShell 版 (削除済み) の置き換えで、プロトコル上の振る舞いは同じ
 (契約は [`docs/PROTOCOL.md`](../docs/PROTOCOL.md))。
 
 - **chip の報告 (hook の代わり)**: Claude desktop のセッションファイル
@@ -26,9 +26,8 @@ PowerShell 版 (`windows-agent/`) の置き換えで、プロトコル上の振�
 
 ## インストール
 
-1. PowerShell 版が入っているなら先に外す (両方動くと close 4000 で接続を奪い合う):
-   `powershell -NoProfile -ExecutionPolicy Bypass -File windows-agent\uninstall.ps1`
-   (設定 `%APPDATA%\chip-remote\config.json` とログはそのまま引き継げる)
+1. 旧 PowerShell 版をタスクスケジューラ (`chip-remote-agent` タスク) に登録していたなら先に削除する
+   (両方動くと close 4000 で接続を奪い合う)。設定 `%APPDATA%\chip-remote\config.json` とログはそのまま引き継げる
 2. GitHub Release [`agent-latest`](https://github.com/ippoan/chip-remote/releases/tag/agent-latest) から
    `chip-remote-agent_x64-setup.exe` を落として実行する。ユーザー単位のインストールで管理者権限は不要。
    コード署名 (Authenticode) はしていないので SmartScreen の警告が出たら「詳細情報 → 実行」。

@@ -123,3 +123,27 @@ jobs:
             --title "Android (latest)" \
             --notes "main ${GITHUB_SHA::7} / run ${GITHUB_RUN_NUMBER} / ${kind}" \
             --prerelease
+
+      # スマホからの DL は GitHub Pages から (Release の asset は署名付き URL へのリダイレクトで、
+      # Android のブラウザ → DownloadManager の受け渡しで止まることがある。AlcoholChecker と同じ配布方式)。
+      # https://ippoan.github.io/chip-remote/chip-remote.apk
+      - name: Publish APK to GitHub Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          sha256sum dist/chip-remote.apk | cut -d' ' -f1 > dist/chip-remote.apk.sha256
+          cp dist/chip-remote.apk dist/chip-remote.apk.sha256 "$RUNNER_TEMP/"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --depth=1 origin gh-pages
+          git worktree add "$RUNNER_TEMP/pages" origin/gh-pages
+          cd "$RUNNER_TEMP/pages"
+          cp "$RUNNER_TEMP/chip-remote.apk" "$RUNNER_TEMP/chip-remote.apk.sha256" .
+          git add chip-remote.apk chip-remote.apk.sha256
+          git commit -m "android: ${GITHUB_SHA::7} (run ${GITHUB_RUN_NUMBER})" || { echo "no change"; exit 0; }
+          for attempt in 1 2 3; do
+            git push origin HEAD:gh-pages && exit 0
+            git pull --rebase origin gh-pages || true
+            sleep 2
+          done
+          echo "::error::Failed to push gh-pages after 3 attempts"; exit 1

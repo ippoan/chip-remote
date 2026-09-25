@@ -1,6 +1,6 @@
 //! Finds and presses `spawn_task` chips in Claude desktop through UI Automation.
 //!
-//! Port of `windows-agent/ChipUia.psm1` (the behaviour there was verified on the real
+//! Port of the retired PowerShell `ChipUia.psm1` (the behaviour there was verified on the real
 //! Claude desktop app; see docs/PROTOCOL.md "UIA での chip の見え方").
 //!
 //! - [`Uia::list_chips`] is read-only: it never moves or raises a window.

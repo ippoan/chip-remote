@@ -1,5 +1,5 @@
 //! Worker connection: reconnect loop, WS session, read-only locate queue and actions.
-//! Behaviour mirrors windows-agent/chip-remote-agent.ps1 (docs/PROTOCOL.md).
+//! Behaviour mirrors the retired PowerShell agent (docs/PROTOCOL.md).
 //!
 //! - config is reloaded before every connect; incomplete → [`Status::NoConfig`], retry 30 s
 //! - `Authorization: Bearer <token>` on the upgrade; the token is never logged
