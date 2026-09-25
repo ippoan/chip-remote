@@ -263,6 +263,9 @@ pub async fn connect(cfg: &Config) -> Result<WsStream, String> {
     }
 }
 
+// tungstenite::Error is large, but these are thin wrappers over its own API; boxing
+// would only add allocations on every send.
+#[allow(clippy::result_large_err)]
 async fn send<S>(ws: &mut WebSocketStream<S>, msg: &ClientMsg) -> Result<(), WsError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -272,6 +275,7 @@ where
     ws.send(Message::Text(json)).await
 }
 
+#[allow(clippy::result_large_err)]
 async fn locate_scan<S>(
     ws: &mut WebSocketStream<S>,
     loc: &mut Locator,
