@@ -52,15 +52,27 @@ function scripted(responses: Array<Response | Error>): { calls: Call[]; fn: type
 const tokenOk = () => Response.json({ access_token: "at-1", expires_in: 3600 });
 
 describe("fcmConfig", () => {
-  it("client email / private key が無ければ null", () => {
-    expect(fcmConfig({ ...env, FCM_PRIVATE_KEY: "" })).toBeNull();
-    expect(fcmConfig({ ...env, FCM_CLIENT_EMAIL: " " })).toBeNull();
+  const key = (o: Record<string, unknown>) => JSON.stringify(o);
+
+  it("鍵 JSON が無い・不正・client email / private key 欠けなら null", () => {
+    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: "" })).toBeNull();
+    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: "{not json" })).toBeNull();
+    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: "a@b", private_key: " " }) })).toBeNull();
+    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: " ", private_key: "k" }) })).toBeNull();
+    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: 1, private_key: 2 }) })).toBeNull();
   });
 
-  it("project id は既定 alc-fcm", () => {
-    const cfg = fcmConfig({ ...env, FCM_PROJECT_ID: undefined } as Env);
-    expect(cfg?.projectId).toBe("alc-fcm");
-    expect(fcmConfig({ ...env, FCM_PROJECT_ID: "other" })?.projectId).toBe("other");
+  it("鍵 JSON から client email / private key を取り出す", () => {
+    const cfg = fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: " a@b ", private_key: "PEM" }) });
+    expect(cfg).toMatchObject({ clientEmail: "a@b", privateKeyPem: "PEM" });
+  });
+
+  it("project id は var > 鍵 JSON > 既定 alc-fcm", () => {
+    const k = key({ client_email: "a@b", private_key: "PEM", project_id: "from-key" });
+    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: k, FCM_PROJECT_ID: "other" })?.projectId).toBe("other");
+    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: k, FCM_PROJECT_ID: undefined } as Env)?.projectId).toBe("from-key");
+    const noProj = key({ client_email: "a@b", private_key: "PEM" });
+    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: noProj, FCM_PROJECT_ID: " " })?.projectId).toBe("alc-fcm");
   });
 });
 
@@ -198,7 +210,7 @@ describe("HubDO: FCM 未設定", () => {
     const chip = await runInDurableObject(hubStub(), async (instance: HubDO) => {
       const target = instance as unknown as { env: Env; sender: unknown };
       const saved = { env: target.env, sender: target.sender };
-      target.env = { ...saved.env, FCM_PRIVATE_KEY: "" };
+      target.env = { ...saved.env, CHIP_REMOTE_FCM_SA_KEY: "" };
       target.sender = null;
       try {
         return (

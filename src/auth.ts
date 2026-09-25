@@ -19,7 +19,8 @@ export async function timingSafeEqual(a: string, b: string): Promise<boolean> {
 }
 
 export async function checkToken(req: Request, env: Env): Promise<TokenCheck> {
-  const configured = env.CHIP_REMOTE_TOKEN ?? "";
+  // secret 投入時の末尾改行 (CR/LF) で全員が 401 にならないよう trim する。
+  const configured = (env.CHIP_REMOTE_TOKEN ?? "").trim();
   if (configured === "") return "not_configured";
 
   const header = req.headers.get("Authorization") ?? "";

@@ -26,13 +26,14 @@ Claude desktop の `spawn_task` chip を Android 通知から起動・非表示�
 
 ## secret
 
-Worker secret (`wrangler secret put <NAME>`、`[secrets] required` は使わない — wrangler.toml 参照):
+Worker secret (`wrangler secret put <NAME>`)。wrangler.toml の `[secrets] required` に列挙し、
+同名が GCP (`cloudsql-sv`) の Secret Manager にある (CI の secret-verify が突合する):
 
 - `CHIP_REMOTE_TOKEN` — hook / agent / phone 共通の Bearer token。未設定なら 503 (fail-closed)
-- `FCM_PRIVATE_KEY` — FCM 送信用 service account の private_key (PKCS8 PEM)
-- (`FCM_CLIENT_EMAIL` は secret ではなく wrangler.toml の var: `chip-remote-fcm@alc-fcm`)
+- `CHIP_REMOTE_FCM_SA_KEY` — FCM 送信専用 SA `chip-remote-fcm@alc-fcm` の鍵 JSON。未設定なら FCM だけスキップ
 
-FCM の 2 つが未設定なら送信は log してスキップする (agent / hook の経路は動く)。
+wrangler 4.79+ は required が未 set だと deploy を落とすので、初回 deploy より前に 2 つとも投入する。
+Android CI 用の repo secret は `GOOGLE_SERVICES_JSON` と `ANDROID_KEYSTORE_*` (SoT は GCP の `CHIP_REMOTE_*`)。
 **secret を会話 / log / tool param に出さない。**
 
 ## ビルド / テスト (Worker)

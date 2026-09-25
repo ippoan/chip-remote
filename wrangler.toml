@@ -16,25 +16,25 @@ workers_dev = true
 enabled = true
 head_sampling_rate = 1
 
-# ─── Secrets (すべて `wrangler secret put <NAME>` で投入する plain worker secret) ─────
-# CHIP_REMOTE_TOKEN  … hook / agent / phone 共通の Bearer token。未設定なら /health 以外
-#                      すべて 503 (fail-closed)。
-# FCM_PRIVATE_KEY    … FCM 送信用 service account の private_key (PKCS8 PEM)。
-#                      JSON の "\n" エスケープのまま貼っても src/fcm.ts が改行に戻す。
-# FCM_CLIENT_EMAIL   … 同 service account の client_email (secret でも var でも可)。
-# FCM_PRIVATE_KEY / FCM_CLIENT_EMAIL が未設定なら FCM 送信は log してスキップする
-# (agent / hook の経路はそのまま動く)。
+# ─── Secrets (plain worker secret、`wrangler secret put <NAME>`) ──────────────
+# 名前は GCP (cloudsql-sv) の Secret Manager と同名にしてあり、CI の secret-verify が
+# `secrets.required` を列挙として GCP と突合する (ci-workflows secret-verify-gcp.yml)。
 #
-# `[secrets] required` は **使わない**: wrangler 4.79+ はこれを worker-scoped
-# secret 宣言と解釈し、未 set だと "required secret not set" で deploy が落ちる
-# (Refs ippoan/mcp-relay-rs#21、cdp-relay / HealthConnectReaderWorker と同様)。
+# CHIP_REMOTE_TOKEN       … hook / agent / phone 共通の Bearer token。空なら /health 以外
+#                           すべて 503 (fail-closed)。前後の空白・改行は trim して比較。
+# CHIP_REMOTE_FCM_SA_KEY  … FCM 送信専用 SA (chip-remote-fcm@alc-fcm、権限は
+#                           roles/firebasecloudmessaging.admin のみ) の鍵 JSON をそのまま。
+#                           空・不正なら FCM 送信だけ log してスキップ (agent / hook 経路は動く)。
+#
+# 注意: wrangler 4.79+ は `secrets.required` の名前が worker に未 set だと deploy を
+# 落とす。初回 deploy (= main への merge) より前に 2 つとも `wrangler secret put` すること。
+[secrets]
+required = ["CHIP_REMOTE_TOKEN", "CHIP_REMOTE_FCM_SA_KEY"]
 
 # ─── 設定値 (文字列 vars。未設定なら src/env.ts の default) ───────────────────
 [vars]
 # FCM HTTP v1 の送信先 Firebase project (alc-app と同じ project を共用)。
 FCM_PROJECT_ID = "alc-fcm"
-# FCM 送信専用 SA (roles/firebasecloudmessaging.admin のみ)。鍵は GCP cloudsql-sv の CHIP_REMOTE_FCM_SA_KEY。
-FCM_CLIENT_EMAIL = "chip-remote-fcm@alc-fcm.iam.gserviceaccount.com"
 # phone の action を agent が処理するまでの待ち時間 (ms)。超過で failed / agent_timeout。
 ACTION_TIMEOUT_MS = "30000"
 # agent が chip.located / chip.not_found を返すまでの安全網 (ms)。agent は 60 秒探すので

@@ -12,10 +12,11 @@ export interface Env {
   // ─── secrets ───
   /** hook / agent / phone 共通の Bearer token。未設定なら /health 以外 503 (fail-closed)。 */
   CHIP_REMOTE_TOKEN?: string;
-  /** FCM 送信用 service account の private_key (PKCS8 PEM)。未設定なら FCM はスキップ。 */
-  FCM_PRIVATE_KEY?: string;
-  /** 同 service account の client_email。未設定なら FCM はスキップ。 */
-  FCM_CLIENT_EMAIL?: string;
+  /**
+   * FCM 送信専用 service account (chip-remote-fcm@alc-fcm) の鍵 JSON をそのまま。
+   * GCP (cloudsql-sv) の同名 secret が SoT。未設定なら FCM はスキップ。
+   */
+  CHIP_REMOTE_FCM_SA_KEY?: string;
 
   // ─── 設定値 (文字列 vars。未設定なら下の default) ───
   /** FCM HTTP v1 の Firebase project id。 */

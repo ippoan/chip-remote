@@ -61,8 +61,11 @@ export default defineWorkersConfig(
                 // テスト用 token (test/helpers.ts の TOKEN と一致させる)。
                 CHIP_REMOTE_TOKEN: "test-token",
                 FCM_PROJECT_ID: "alc-fcm",
-                FCM_CLIENT_EMAIL: "chip-remote@alc-fcm.iam.gserviceaccount.com",
-                FCM_PRIVATE_KEY: testPrivateKey,
+                CHIP_REMOTE_FCM_SA_KEY: JSON.stringify({
+                  client_email: "chip-remote@alc-fcm.iam.gserviceaccount.com",
+                  private_key: testPrivateKey,
+                  project_id: "alc-fcm",
+                }),
                 ACTION_TIMEOUT_MS: "30000",
                 LOCATE_TIMEOUT_MS: "75000",
               },

@@ -24,12 +24,26 @@ export interface FcmConfig {
   privateKeyPem: string;
 }
 
-/** FCM secret が揃っていれば設定を返す。欠けていれば null (= 送信スキップ)。 */
+/**
+ * secret CHIP_REMOTE_FCM_SA_KEY (service account の鍵 JSON をそのまま) から設定を返す。
+ * 未設定・JSON 不正・private_key / client_email 欠けなら null (= 送信スキップ)。
+ * project id は var FCM_PROJECT_ID > 鍵 JSON の project_id > 既定の順。
+ */
 export function fcmConfig(env: Env): FcmConfig | null {
-  const clientEmail = (env.FCM_CLIENT_EMAIL ?? "").trim();
-  const privateKeyPem = env.FCM_PRIVATE_KEY ?? "";
+  const raw = (env.CHIP_REMOTE_FCM_SA_KEY ?? "").trim();
+  if (raw === "") return null;
+  let key: { private_key?: unknown; client_email?: unknown; project_id?: unknown };
+  try {
+    key = JSON.parse(raw);
+  } catch {
+    console.error("CHIP_REMOTE_FCM_SA_KEY is not valid JSON; FCM disabled");
+    return null;
+  }
+  const clientEmail = typeof key.client_email === "string" ? key.client_email.trim() : "";
+  const privateKeyPem = typeof key.private_key === "string" ? key.private_key : "";
   if (clientEmail === "" || privateKeyPem.trim() === "") return null;
-  const projectId = (env.FCM_PROJECT_ID ?? "").trim() || DEFAULT_PROJECT_ID;
+  const keyProject = typeof key.project_id === "string" ? key.project_id.trim() : "";
+  const projectId = (env.FCM_PROJECT_ID ?? "").trim() || keyProject || DEFAULT_PROJECT_ID;
   return { projectId, clientEmail, privateKeyPem };
 }
 
