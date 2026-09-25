@@ -26,14 +26,14 @@ Claude desktop の `spawn_task` chip を Android 通知から起動・非表示�
 
 ## secret
 
-Worker secret (`wrangler secret put <NAME>`)。wrangler.toml の `[secrets] required` に列挙し、
-同名が GCP (`cloudsql-sv`) の Secret Manager にある (CI の secret-verify が突合する):
+Worker の secret は CF Secrets Store binding (wrangler.toml の `[[secrets_store_secrets]]`)。
+SoT は GCP (`cloudsql-sv`) の同名 secret で、secrets-inventory MCP の `sync_from_gcp` で写す:
 
-- `CHIP_REMOTE_TOKEN` — hook / agent / phone 共通の Bearer token。未設定なら 503 (fail-closed)
-- `CHIP_REMOTE_FCM_SA_KEY` — FCM 送信専用 SA `chip-remote-fcm@alc-fcm` の鍵 JSON。未設定なら FCM だけスキップ
+- `CHIP_REMOTE_TOKEN` — hook / agent / phone 共通の Bearer token。取れなければ 503 (fail-closed)
+- `CHIP_REMOTE_FCM_SA_KEY` — FCM 送信専用 SA `chip-remote-fcm@alc-fcm` の鍵 JSON。取れなければ FCM だけスキップ
 
-wrangler 4.79+ は required が未 set だと deploy を落とすので、初回 deploy より前に 2 つとも投入する。
-Android CI 用の repo secret は `GOOGLE_SERVICES_JSON` と `ANDROID_KEYSTORE_*` (SoT は GCP の `CHIP_REMOTE_*`)。
+Android CI は GitHub org secret `CHIP_REMOTE_GOOGLE_SERVICES_JSON` / `CHIP_REMOTE_ANDROID_KEYSTORE_BASE64` /
+`CHIP_REMOTE_ANDROID_KEYSTORE_PASSWORD` を使う (同じく GCP から `sync_from_gcp` で写したもの)。
 **secret を会話 / log / tool param に出さない。**
 
 ## ビルド / テスト (Worker)

@@ -29,15 +29,15 @@ jobs:
       - uses: actions/checkout@v4
 
       # google-services.json (SoT は GCP cloudsql-sv の CHIP_REMOTE_GOOGLE_SERVICES_JSON) を
-      # 丸ごと 1 つの secret で受け、このアプリの client だけ取り出して FIREBASE_* に展開する。
+      # 丸ごと 1 つの org secret (同名、sync_from_gcp で写したもの) で受け、このアプリの client だけ取り出して FIREBASE_* に展開する。
       # 未設定でもビルドは通る (アプリが「Firebase 未設定」と表示するだけ)。
       - name: Firebase config (if configured)
         env:
-          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.CHIP_REMOTE_GOOGLE_SERVICES_JSON }}
         run: |
           set -euo pipefail
           if [ -z "$GOOGLE_SERVICES_JSON" ]; then
-            echo "::notice::GOOGLE_SERVICES_JSON is not set; Firebase disabled in this build"
+            echo "::notice::CHIP_REMOTE_GOOGLE_SERVICES_JSON is not set; Firebase disabled in this build"
             exit 0
           fi
           pick() { printf '%s' "$GOOGLE_SERVICES_JSON" | jq -er "$1"; }
@@ -67,14 +67,14 @@ jobs:
       - name: Restore keystore (if configured)
         id: keystore
         env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_BASE64: ${{ secrets.CHIP_REMOTE_ANDROID_KEYSTORE_BASE64 }}
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
             echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
             echo "signed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::ANDROID_KEYSTORE_BASE64 is not set; building debug APK"
+            echo "::notice::CHIP_REMOTE_ANDROID_KEYSTORE_BASE64 is not set; building debug APK"
             echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -84,9 +84,10 @@ jobs:
       - name: Build signed release APK
         if: steps.keystore.outputs.signed == 'true'
         env:
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          # PKCS12 なので store / key パスワードは同一。alias は秘密ではない。
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.CHIP_REMOTE_ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: chipremote
+          ANDROID_KEY_PASSWORD: ${{ secrets.CHIP_REMOTE_ANDROID_KEYSTORE_PASSWORD }}
         run: |
           ./gradlew assembleRelease
           mkdir -p dist

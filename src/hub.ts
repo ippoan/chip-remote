@@ -398,7 +398,7 @@ export class HubDO extends DurableObject<Env> {
 
   /** 登録済み全 device に data メッセージを送る。FCM 未設定なら log してスキップ。 */
   private async notify(data: Record<string, string>): Promise<void> {
-    const sender = this.fcm();
+    const sender = await this.fcm();
     if (!sender) {
       console.log(`fcm not configured; skip ${data.type} task_id=${data.task_id}`);
       return;
@@ -419,9 +419,9 @@ export class HubDO extends DurableObject<Env> {
     });
   }
 
-  private fcm(): FcmSender | null {
+  private async fcm(): Promise<FcmSender | null> {
     if (this.sender) return this.sender;
-    const cfg = fcmConfig(this.env);
+    const cfg = await fcmConfig(this.env);
     if (!cfg) return null;
     this.sender = new FcmSender(cfg, {
       get: () => {

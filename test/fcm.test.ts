@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import { CachedToken, FCM_SCOPE, FcmSender, TOKEN_URL, TokenCache, fcmConfig, pemToDer } from "../src/fcm";
-import type { Env } from "../src/env";
+import { type Env, readSecret } from "../src/env";
 import type { HubDO } from "../src/hub";
 import { fcm, hubStub, uid } from "./helpers";
 
@@ -54,25 +54,41 @@ const tokenOk = () => Response.json({ access_token: "at-1", expires_in: 3600 });
 describe("fcmConfig", () => {
   const key = (o: Record<string, unknown>) => JSON.stringify(o);
 
-  it("鍵 JSON が無い・不正・client email / private key 欠けなら null", () => {
-    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: "" })).toBeNull();
-    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: "{not json" })).toBeNull();
-    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: "a@b", private_key: " " }) })).toBeNull();
-    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: " ", private_key: "k" }) })).toBeNull();
-    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: 1, private_key: 2 }) })).toBeNull();
+  it("鍵 JSON が無い・不正・client email / private key 欠けなら null", async () => {
+    expect(await fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: "" })).toBeNull();
+    expect(await fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: "{not json" })).toBeNull();
+    expect(await fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: "a@b", private_key: " " }) })).toBeNull();
+    expect(await fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: " ", private_key: "k" }) })).toBeNull();
+    expect(await fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: 1, private_key: 2 }) })).toBeNull();
   });
 
-  it("鍵 JSON から client email / private key を取り出す", () => {
-    const cfg = fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: " a@b ", private_key: "PEM" }) });
+  it("鍵 JSON から client email / private key を取り出す", async () => {
+    const cfg = await fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: key({ client_email: " a@b ", private_key: "PEM" }) });
     expect(cfg).toMatchObject({ clientEmail: "a@b", privateKeyPem: "PEM" });
   });
 
-  it("project id は var > 鍵 JSON > 既定 alc-fcm", () => {
+  it("project id は var > 鍵 JSON > 既定 alc-fcm", async () => {
     const k = key({ client_email: "a@b", private_key: "PEM", project_id: "from-key" });
-    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: k, FCM_PROJECT_ID: "other" })?.projectId).toBe("other");
-    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: k, FCM_PROJECT_ID: undefined } as Env)?.projectId).toBe("from-key");
+    const project = async (e: Env) => (await fcmConfig(e))?.projectId;
+    expect(await project({ ...env, CHIP_REMOTE_FCM_SA_KEY: k, FCM_PROJECT_ID: "other" })).toBe("other");
+    expect(await project({ ...env, CHIP_REMOTE_FCM_SA_KEY: k, FCM_PROJECT_ID: undefined } as Env)).toBe("from-key");
     const noProj = key({ client_email: "a@b", private_key: "PEM" });
-    expect(fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: noProj, FCM_PROJECT_ID: " " })?.projectId).toBe("alc-fcm");
+    expect(await project({ ...env, CHIP_REMOTE_FCM_SA_KEY: noProj, FCM_PROJECT_ID: " " })).toBe("alc-fcm");
+  });
+
+  it("Secrets Store binding (get()) からも読める", async () => {
+    const k = key({ client_email: "a@b", private_key: "PEM" });
+    const cfg = await fcmConfig({ ...env, CHIP_REMOTE_FCM_SA_KEY: { get: async () => k } });
+    expect(cfg?.clientEmail).toBe("a@b");
+  });
+});
+
+describe("readSecret", () => {
+  it("未設定 / 文字列 / binding / binding の失敗", async () => {
+    expect(await readSecret(undefined)).toBe("");
+    expect(await readSecret("v")).toBe("v");
+    expect(await readSecret({ get: async () => "b" })).toBe("b");
+    expect(await readSecret({ get: async () => { throw new Error("not found"); } })).toBe("");
   });
 });
 

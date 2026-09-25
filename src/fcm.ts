@@ -9,7 +9,7 @@
  * send() は例外を投げず、結果を "ok" / "unregistered" / "error" で返す
  * (unregistered = 404 か errorCode UNREGISTERED → 呼び出し側が device token を削除)。
  */
-import type { Env } from "./env";
+import { type Env, readSecret } from "./env";
 
 export const TOKEN_URL = "https://oauth2.googleapis.com/token";
 export const FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging";
@@ -29,8 +29,8 @@ export interface FcmConfig {
  * 未設定・JSON 不正・private_key / client_email 欠けなら null (= 送信スキップ)。
  * project id は var FCM_PROJECT_ID > 鍵 JSON の project_id > 既定の順。
  */
-export function fcmConfig(env: Env): FcmConfig | null {
-  const raw = (env.CHIP_REMOTE_FCM_SA_KEY ?? "").trim();
+export async function fcmConfig(env: Env): Promise<FcmConfig | null> {
+  const raw = (await readSecret(env.CHIP_REMOTE_FCM_SA_KEY)).trim();
   if (raw === "") return null;
   let key: { private_key?: unknown; client_email?: unknown; project_id?: unknown };
   try {

@@ -4,7 +4,7 @@
  * `Authorization: Bearer <CHIP_REMOTE_TOKEN>` を定数時間で比較する。両辺を SHA-256 に
  * してから crypto.subtle.timingSafeEqual に掛けるので、長さの違いも漏れない。
  */
-import type { Env } from "./env";
+import { type Env, readSecret } from "./env";
 
 export type TokenCheck = "ok" | "not_configured" | "missing_token" | "bad_token";
 
@@ -20,7 +20,7 @@ export async function timingSafeEqual(a: string, b: string): Promise<boolean> {
 
 export async function checkToken(req: Request, env: Env): Promise<TokenCheck> {
   // secret 投入時の末尾改行 (CR/LF) で全員が 401 にならないよう trim する。
-  const configured = (env.CHIP_REMOTE_TOKEN ?? "").trim();
+  const configured = (await readSecret(env.CHIP_REMOTE_TOKEN)).trim();
   if (configured === "") return "not_configured";
 
   const header = req.headers.get("Authorization") ?? "";

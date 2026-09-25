@@ -16,20 +16,26 @@ workers_dev = true
 enabled = true
 head_sampling_rate = 1
 
-# ─── Secrets (plain worker secret、`wrangler secret put <NAME>`) ──────────────
-# 名前は GCP (cloudsql-sv) の Secret Manager と同名にしてあり、CI の secret-verify が
-# `secrets.required` を列挙として GCP と突合する (ci-workflows secret-verify-gcp.yml)。
+# ─── Secrets (CF Secrets Store binding) ──────────────────────────────────────
+# SoT は GCP (cloudsql-sv) の同名 secret。secrets-inventory MCP の sync_from_gcp で
+# Secrets Store に写してある (値は会話 / log に出さない)。CI の secret-verify は
+# secrets_store_secrets[*].secret_name を自動抽出して GCP と突合する。
+# `[secrets] required` は使わない (wrangler 4.79+ で binding と衝突する。cdp-relay 参照)。
 #
-# CHIP_REMOTE_TOKEN       … hook / agent / phone 共通の Bearer token。空なら /health 以外
-#                           すべて 503 (fail-closed)。前後の空白・改行は trim して比較。
+# CHIP_REMOTE_TOKEN       … hook / agent / phone 共通の Bearer token。取れなければ /health
+#                           以外すべて 503 (fail-closed)。前後の空白・改行は trim して比較。
 # CHIP_REMOTE_FCM_SA_KEY  … FCM 送信専用 SA (chip-remote-fcm@alc-fcm、権限は
 #                           roles/firebasecloudmessaging.admin のみ) の鍵 JSON をそのまま。
-#                           空・不正なら FCM 送信だけ log してスキップ (agent / hook 経路は動く)。
-#
-# 注意: wrangler 4.79+ は `secrets.required` の名前が worker に未 set だと deploy を
-# 落とす。初回 deploy (= main への merge) より前に 2 つとも `wrangler secret put` すること。
-[secrets]
-required = ["CHIP_REMOTE_TOKEN", "CHIP_REMOTE_FCM_SA_KEY"]
+#                           取れない・不正なら FCM 送信だけ log してスキップ。
+[[secrets_store_secrets]]
+binding = "CHIP_REMOTE_TOKEN"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "CHIP_REMOTE_TOKEN"
+
+[[secrets_store_secrets]]
+binding = "CHIP_REMOTE_FCM_SA_KEY"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "CHIP_REMOTE_FCM_SA_KEY"
 
 # ─── 設定値 (文字列 vars。未設定なら src/env.ts の default) ───────────────────
 [vars]
