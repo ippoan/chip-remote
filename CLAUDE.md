@@ -30,7 +30,7 @@ Worker secret (`wrangler secret put <NAME>`、`[secrets] required` は使わな�
 
 - `CHIP_REMOTE_TOKEN` — hook / agent / phone 共通の Bearer token。未設定なら 503 (fail-closed)
 - `FCM_PRIVATE_KEY` — FCM 送信用 service account の private_key (PKCS8 PEM)
-- `FCM_CLIENT_EMAIL` — 同 service account の client_email
+- (`FCM_CLIENT_EMAIL` は secret ではなく wrangler.toml の var: `chip-remote-fcm@alc-fcm`)
 
 FCM の 2 つが未設定なら送信は log してスキップする (agent / hook の経路は動く)。
 **secret を会話 / log / tool param に出さない。**

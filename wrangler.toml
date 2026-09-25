@@ -33,6 +33,8 @@ head_sampling_rate = 1
 [vars]
 # FCM HTTP v1 の送信先 Firebase project (alc-app と同じ project を共用)。
 FCM_PROJECT_ID = "alc-fcm"
+# FCM 送信専用 SA (roles/firebasecloudmessaging.admin のみ)。鍵は GCP cloudsql-sv の CHIP_REMOTE_FCM_SA_KEY。
+FCM_CLIENT_EMAIL = "chip-remote-fcm@alc-fcm.iam.gserviceaccount.com"
 # phone の action を agent が処理するまでの待ち時間 (ms)。超過で failed / agent_timeout。
 ACTION_TIMEOUT_MS = "30000"
 # agent が chip.located / chip.not_found を返すまでの安全網 (ms)。agent は 60 秒探すので
